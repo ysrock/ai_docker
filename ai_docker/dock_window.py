@@ -235,7 +235,7 @@ class DragGrip(QWidget):
         self._theme = theme
         self._hovered = False
         self.setCursor(Qt.SizeAllCursor)
-        self.setToolTip("按住拖动整个悬浮窗位置")
+        self.setToolTip("左键拖动悬浮窗位置 · 右键打开全局菜单")
         self.setFixedSize(16, height)
 
     def set_theme(self, theme: str) -> None:
@@ -1073,6 +1073,7 @@ class AgentDockWindow(QWidget):
         self._buttons: dict[str, AgentIconButton] = {}
         self._icons: dict[str, QIcon] = {}
         self._agent_windows: dict[str, list[dict[str, Any]]] = {}
+        self._last_notif_map: dict[str, AgentNotificationSummary] = {}
         self._last_shelf_sig: tuple[Any, ...] | None = None
         self._taskbar_hider = TaskbarHider()
         self._notif_tracker = NotificationTracker()
@@ -1420,6 +1421,7 @@ class AgentDockWindow(QWidget):
         self._agent_windows = get_agent_window_map(agents)
         fg_hwnd = get_foreground_hwnd()
         notif_map = self._notif_tracker.poll(agents, self._agent_windows, fg_hwnd)
+        self._last_notif_map = notif_map
 
         for aid, btn in self._buttons.items():
             wins = self._agent_windows.get(aid, [])
@@ -1496,99 +1498,113 @@ class AgentDockWindow(QWidget):
     ) -> None:
         self._show_context_menu(global_pos, agent=agent, target_hwnd=hwnd)
 
-    def _show_context_menu(
-        self,
-        global_pos: QPoint,
-        agent: dict[str, Any] | None = None,
-        target_hwnd: int | None = None,
-    ) -> None:
+    def _build_agent_menu(
+        self, agent: dict[str, Any], target_hwnd: int | None = None
+    ) -> QMenu:
+        """Context menu scoped strictly to one Agent (or one of its open project windows)."""
         menu = QMenu(self)
+        aid = agent.get("id", "")
+        name = agent.get("name", "")
+        open_wins = self._agent_windows.get(aid, [])
+        notif_summary = self._last_notif_map.get(aid, AgentNotificationSummary())
 
-        if agent is not None:
-            aid = agent.get("id", "")
-            open_wins = self._agent_windows.get(aid, [])
-            if target_hwnd is not None:
-                act_focus = menu.addAction("切换到该窗口")
-                act_focus.triggered.connect(lambda: self._on_window_chip_clicked(target_hwnd, aid))
+        if target_hwnd is not None:
+            act_focus = menu.addAction("切换到该窗口")
+            act_focus.triggered.connect(lambda: self._on_window_chip_clicked(target_hwnd, aid))
+            if target_hwnd in notif_summary.by_hwnd:
                 act_clear_win = menu.addAction("清除该窗口通知角标")
                 act_clear_win.triggered.connect(
                     lambda: (self._notif_tracker.clear_window(target_hwnd, aid), self._refresh_state())
                 )
-                menu.addSeparator()
-            elif open_wins:
-                for w in open_wins[:8]:
-                    proj = w.get("project") or w.get("title") or agent.get("name", "窗口")
-                    hwnd = w["hwnd"]
-                    act = menu.addAction(f"切换到：{proj}")
-                    act.triggered.connect(
-                        lambda checked=False, h=hwnd, a=aid: self._on_window_chip_clicked(h, a)
-                    )
-                menu.addSeparator()
-
-            new_inst = menu.addAction(f"新开实例：{agent.get('name', '')}")
-            new_inst.triggered.connect(lambda: launch_agent(agent, focus_existing=False))
-
-            is_released = agent.get("hide_from_taskbar", True) is False
-            global_hide = bool(self.config["ui"].get("hide_from_taskbar", True))
-            if is_released:
-                rel_act = menu.addAction(f"重新收进悬浮窗：{agent.get('name', '')}")
-                if not global_hide:
-                    rel_act.setText(f"重新收进悬浮窗：{agent.get('name', '')}（全局隐藏已关）")
-                    rel_act.setEnabled(False)
-                else:
-                    rel_act.triggered.connect(
-                        lambda checked=False, a=aid: self._set_agent_released(a, False)
-                    )
-            else:
-                rel_act = menu.addAction(f"释放到系统任务栏：{agent.get('name', '')}")
-                rel_act.triggered.connect(
-                    lambda checked=False, a=aid: self._set_agent_released(a, True)
+            menu.addSeparator()
+        elif open_wins:
+            for w in open_wins[:8]:
+                proj = w.get("project") or w.get("title") or name or "窗口"
+                hwnd = w["hwnd"]
+                act = menu.addAction(f"切换到：{proj}")
+                act.triggered.connect(
+                    lambda checked=False, h=hwnd, a=aid: self._on_window_chip_clicked(h, a)
                 )
-
-            if target_hwnd is None:
-                visible_ids = [
-                    a.get("id", "")
-                    for a in self.config.get("agents", [])
-                    if a.get("enabled", True) is not False
-                ]
-                visible_count = len(visible_ids)
-                cur_vis_idx = visible_ids.index(aid) if aid in visible_ids else -1
-
-                if visible_count > 1 and cur_vis_idx >= 0:
-                    move_menu = menu.addMenu("调整位置（也可直接左键左右拖动）")
-                    act_left = move_menu.addAction("向左移一位")
-                    act_left.setEnabled(cur_vis_idx > 0)
-                    act_left.triggered.connect(
-                        lambda checked=False, a=aid: self._shift_agent(a, -1)
-                    )
-                    act_right = move_menu.addAction("向右移一位")
-                    act_right.setEnabled(cur_vis_idx < visible_count - 1)
-                    act_right.triggered.connect(
-                        lambda checked=False, a=aid: self._shift_agent(a, 1)
-                    )
-                    move_menu.addSeparator()
-                    act_first = move_menu.addAction("移到最左")
-                    act_first.setEnabled(cur_vis_idx > 0)
-                    act_first.triggered.connect(
-                        lambda checked=False, a=aid: self._move_agent_to_visible_index(a, 0)
-                    )
-                    act_last = move_menu.addAction("移到最右")
-                    act_last.setEnabled(cur_vis_idx < visible_count - 1)
-                    act_last.triggered.connect(
-                        lambda checked=False, a=aid, last=visible_count - 1: self._move_agent_to_visible_index(a, last)
-                    )
-
-                hide_icon_act = menu.addAction(f"隐藏该图标：{agent.get('name', '')}")
-                if visible_count <= 1:
-                    hide_icon_act.setEnabled(False)
-                    hide_icon_act.setText("隐藏该图标（至少保留 1 个）")
-                else:
-                    hide_icon_act.triggered.connect(
-                        lambda checked=False, a=aid: self._set_agent_visible(a, False)
-                    )
             menu.addSeparator()
 
-        # Agent discovery & manual add
+        new_inst = menu.addAction(f"新开实例：{name}")
+        new_inst.triggered.connect(lambda: launch_agent(agent, focus_existing=False))
+
+        is_released = agent.get("hide_from_taskbar", True) is False
+        global_hide = bool(self.config["ui"].get("hide_from_taskbar", True))
+        if is_released:
+            rel_act = menu.addAction(f"重新收进悬浮窗：{name}")
+            if not global_hide:
+                rel_act.setText(f"重新收进悬浮窗：{name}（全局隐藏已关）")
+                rel_act.setEnabled(False)
+            else:
+                rel_act.triggered.connect(
+                    lambda checked=False, a=aid: self._set_agent_released(a, False)
+                )
+        else:
+            rel_act = menu.addAction(f"释放到系统任务栏：{name}")
+            rel_act.triggered.connect(
+                lambda checked=False, a=aid: self._set_agent_released(a, True)
+            )
+
+        if target_hwnd is None:
+            if notif_summary.has_alert:
+                clear_act = menu.addAction("清除通知角标")
+                clear_act.triggered.connect(
+                    lambda checked=False, a=aid, hs=[w["hwnd"] for w in open_wins]: (
+                        self._notif_tracker.clear_agent(a, hs),
+                        self._refresh_state(),
+                    )
+                )
+
+            visible_ids = [
+                a.get("id", "")
+                for a in self.config.get("agents", [])
+                if a.get("enabled", True) is not False
+            ]
+            visible_count = len(visible_ids)
+            cur_vis_idx = visible_ids.index(aid) if aid in visible_ids else -1
+
+            if visible_count > 1 and cur_vis_idx >= 0:
+                move_menu = menu.addMenu("调整位置")
+                act_left = move_menu.addAction("向左移一位")
+                act_left.setEnabled(cur_vis_idx > 0)
+                act_left.triggered.connect(
+                    lambda checked=False, a=aid: self._shift_agent(a, -1)
+                )
+                act_right = move_menu.addAction("向右移一位")
+                act_right.setEnabled(cur_vis_idx < visible_count - 1)
+                act_right.triggered.connect(
+                    lambda checked=False, a=aid: self._shift_agent(a, 1)
+                )
+                move_menu.addSeparator()
+                act_first = move_menu.addAction("移到最左")
+                act_first.setEnabled(cur_vis_idx > 0)
+                act_first.triggered.connect(
+                    lambda checked=False, a=aid: self._move_agent_to_visible_index(a, 0)
+                )
+                act_last = move_menu.addAction("移到最右")
+                act_last.setEnabled(cur_vis_idx < visible_count - 1)
+                act_last.triggered.connect(
+                    lambda checked=False, a=aid, last=visible_count - 1: self._move_agent_to_visible_index(a, last)
+                )
+
+            menu.addSeparator()
+            hide_icon_act = menu.addAction(f"隐藏该图标：{name}")
+            if visible_count <= 1:
+                hide_icon_act.setEnabled(False)
+                hide_icon_act.setText("隐藏该图标（至少保留 1 个）")
+            else:
+                hide_icon_act.triggered.connect(
+                    lambda checked=False, a=aid: self._set_agent_visible(a, False)
+                )
+
+        return menu
+
+    def _build_global_menu(self) -> QMenu:
+        """Context menu for the drag grip / empty capsule area (global AI docker settings)."""
+        menu = QMenu(self)
+
         discover_act = menu.addAction("扫描本机新安装的 Agent...")
         discover_act.triggered.connect(self._open_discover_dialog)
 
@@ -1687,6 +1703,19 @@ class AgentDockWindow(QWidget):
         quit_action = menu.addAction("退出 AI docker (还原任务栏图标)")
         quit_action.triggered.connect(self._quit_app)
 
+        return menu
+
+    def _show_context_menu(
+        self,
+        global_pos: QPoint,
+        agent: dict[str, Any] | None = None,
+        target_hwnd: int | None = None,
+    ) -> None:
+        menu = (
+            self._build_agent_menu(agent, target_hwnd=target_hwnd)
+            if agent is not None
+            else self._build_global_menu()
+        )
         menu.exec(global_pos)
 
     def _open_discover_dialog(self) -> None:

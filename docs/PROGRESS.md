@@ -41,6 +41,9 @@
 - 新增**释放指定 Agent 到系统任务栏 / 重新收进悬浮窗**功能（`ai_docker/dock_window.py`）：
   - 右键任意顶部图标或项目卡片可直接点击“释放到系统任务栏 / 重新收进悬浮窗”，立即通过 `ITaskbarList::AddTab` 还原该 Agent 所有运行窗口并写入 `hide_from_taskbar`。
   - 右键全局菜单新增“释放指定 Agent 到任务栏”子菜单（显示已释放计数并支持“全部重新收进悬浮窗”）；已释放且运行中的 Agent 图标底部显示空心圆环以区别于已收纳的实心圆点。
+- 拆分右键菜单作用域（`ai_docker/dock_window.py`）：
+  - 在左侧拖动区（`DragGrip` 或顶栏空白边缘）右键显示全局 `AI docker` 菜单（`_build_global_menu`）；
+  - 在顶部 Agent 图标或下方项目行上右键仅显示针对该 Agent / 窗口的专属精简菜单（`_build_agent_menu`），且仅在存在未读通知时才展示消角标项。
 
 ## 后续规划
 - 支持自定义全局快捷键呼出/切换悬浮窗。
