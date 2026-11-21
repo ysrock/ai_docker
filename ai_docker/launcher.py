@@ -302,6 +302,29 @@ def _find_browser(preferred: str | None = None) -> str | None:
     return None
 
 
+_VSCODE_NEW_WINDOW_EXES = {
+    "cursor.exe",
+    "code.exe",
+    "windsurf.exe",
+    "trae.exe",
+    "antigravity ide.exe",
+    "kiro.exe",
+}
+
+
+def _build_exe_launch_args(agent: dict[str, Any], force_new: bool) -> list[str]:
+    args = [str(a) for a in agent.get("args", [])]
+    if not force_new:
+        return args
+    extra = agent.get("new_instance_args")
+    if isinstance(extra, list):
+        return [*args, *(str(a) for a in extra)]
+    exe_name = os.path.basename(agent.get("path", "")).lower()
+    if exe_name in _VSCODE_NEW_WINDOW_EXES and "--new-window" not in args and "-n" not in args:
+        return [*args, "--new-window"]
+    return args
+
+
 def launch_agent(agent: dict[str, Any], focus_existing: bool = True) -> tuple[bool, str]:
     """Focus existing window(s) (cycling when multiple) if enabled and found, otherwise launch."""
     if focus_existing:
@@ -324,6 +347,7 @@ def launch_agent(agent: dict[str, Any], focus_existing: bool = True) -> tuple[bo
                 _last_focused_by_agent[aid] = target_hwnd
                 return True, f"focused:{agent.get('name', '')}"
 
+    force_new = not focus_existing
     atype = agent.get("type", "exe")
     creationflags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
 
@@ -331,7 +355,7 @@ def launch_agent(agent: dict[str, Any], focus_existing: bool = True) -> tuple[bo
         path = agent.get("path", "")
         if not path or not Path(path).exists():
             return False, f"找不到程序路径: {path}"
-        args = [str(a) for a in agent.get("args", [])]
+        args = _build_exe_launch_args(agent, force_new=force_new)
         cwd = agent.get("cwd") or str(Path(path).parent)
         subprocess.Popen([path, *args], cwd=cwd, creationflags=creationflags)
         return True, f"launched_exe:{path}"
@@ -386,7 +410,8 @@ def launch_agent(agent: dict[str, Any], focus_existing: bool = True) -> tuple[bo
         if agent.get("app_mode", True):
             browser = _find_browser(agent.get("browser"))
             if browser:
-                subprocess.Popen([browser, f"--app={url}"], creationflags=creationflags)
+                web_cmd = [browser, "--new-window", f"--app={url}"] if force_new else [browser, f"--app={url}"]
+                subprocess.Popen(web_cmd, creationflags=creationflags)
                 return True, f"launched_web_app:{url}"
         webbrowser.open(url)
         return True, f"launched_web:{url}"

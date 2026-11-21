@@ -281,6 +281,7 @@ class AgentIconButton(QWidget):
     """Top-row icon button with smooth 60fps macOS Dock wave magnification & classic 4px dot."""
 
     clicked = Signal(dict)
+    double_clicked = Signal(dict)
     right_clicked = Signal(dict, QPoint)
 
     def __init__(
@@ -307,6 +308,13 @@ class AgentIconButton(QWidget):
         self._notif_text = ""
         self._press_global: QPoint | None = None
         self._reordering = False
+        self._suppress_next_release = False
+
+        # Short single-click debounce so double-click opens a new instance without double-firing
+        self._click_timer = QTimer(self)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.setInterval(220)
+        self._click_timer.timeout.connect(lambda: self.clicked.emit(self.agent))
 
         # Smooth magnification animation state
         self._scale = 1.0
@@ -365,9 +373,9 @@ class AgentIconButton(QWidget):
         name = self.agent.get("name", "Agent")
         type_label = TYPE_LABELS.get(self.agent.get("type", "exe"), "应用")
         if self._window_count > 1:
-            status = f"运行中 ({self._window_count} 个窗口)"
+            status = f"运行中 ({self._window_count} 个窗口 · 双击新开)"
         elif self._window_count == 1:
-            status = "运行中"
+            status = "运行中 · 双击新开"
         else:
             status = type_label
         lines = [f"{name}  ·  {status}"]
@@ -411,6 +419,7 @@ class AgentIconButton(QWidget):
 
         if self._press_global is not None and (event.buttons() & Qt.LeftButton):
             if not self._reordering and (cur_global - self._press_global).manhattanLength() > 8:
+                self._click_timer.stop()
                 self._reordering = True
                 self._pressed = False
                 self.setCursor(Qt.ClosedHandCursor)
@@ -430,8 +439,29 @@ class AgentIconButton(QWidget):
             parent_bar.update_wave_from_global(cur_global)
         super().mouseMoveEvent(event)
 
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self._click_timer.stop()
+            self._suppress_next_release = True
+            self._pressed = False
+            self._reordering = False
+            self._press_global = None
+            self.setCursor(Qt.PointingHandCursor)
+            self.update()
+            self.double_clicked.emit(self.agent)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
+            if self._suppress_next_release:
+                self._suppress_next_release = False
+                self._pressed = False
+                self._press_global = None
+                self.update()
+                event.accept()
+                return
             was_reordering = self._reordering
             self._reordering = False
             self._pressed = False
@@ -443,7 +473,7 @@ class AgentIconButton(QWidget):
                 if isinstance(parent_bar, TopDockCapsule):
                     parent_bar.finish_reorder()
             elif self.rect().contains(event.position().toPoint()):
-                self.clicked.emit(self.agent)
+                self._click_timer.start()
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -1259,6 +1289,7 @@ class AgentDockWindow(QWidget):
                 parent=self._top_bar,
             )
             btn.clicked.connect(self._on_agent_clicked)
+            btn.double_clicked.connect(self._on_agent_double_clicked)
             btn.right_clicked.connect(self._on_agent_right_clicked)
             self._top_bar.row_layout.addWidget(btn)
             self._buttons[aid] = btn
@@ -1430,6 +1461,13 @@ class AgentDockWindow(QWidget):
             QMessageBox.warning(self, "AI docker 启动失败", f"{agent.get('name', '')}: {msg}")
         else:
             QTimer.singleShot(350, self._refresh_state)
+
+    def _on_agent_double_clicked(self, agent: dict[str, Any]) -> None:
+        ok, msg = launch_agent(agent, focus_existing=False)
+        if not ok:
+            QMessageBox.warning(self, "AI docker 启动失败", f"{agent.get('name', '')}: {msg}")
+        else:
+            QTimer.singleShot(500, self._refresh_state)
 
     def _on_window_chip_clicked(self, hwnd: int, agent_id: str) -> None:
         wins = self._agent_windows.get(agent_id, [])
