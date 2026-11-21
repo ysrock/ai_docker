@@ -236,9 +236,14 @@ class UpdaterTests(unittest.TestCase):
             self.assertTrue(r_dirty.has_local_changes)
             run(["git", "checkout", "--", "app.txt"], clone)
 
-            # Execute real update.ps1 -NoLaunch on the cloned repo
+            # Execute real update.ps1 -NoLaunch on the cloned repo (and verify UTF-8 BOM for PS 5.1)
+            update_script = Path(__file__).resolve().parent.parent / "update.ps1"
+            self.assertTrue(
+                update_script.read_bytes().startswith(b"\xef\xbb\xbf"),
+                "update.ps1 must include UTF-8 BOM so Windows PowerShell 5.1 decodes Chinese text",
+            )
             if sys.platform == "win32":
-                shell = shutil.which("pwsh") or shutil.which("powershell") or "powershell.exe"
+                shell = shutil.which("powershell") or shutil.which("pwsh") or "powershell.exe"
                 proc = subprocess.run(
                     [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(clone / "update.ps1"), "-NoLaunch"],
                     cwd=str(clone),
@@ -249,6 +254,21 @@ class UpdaterTests(unittest.TestCase):
                 self.assertEqual((clone / "app.txt").read_text(encoding="utf-8").strip(), "v2")
                 self.assertEqual(local_cfg.read_text(encoding="utf-8"), '{"ui": {"theme": "light"}, "agents": []}')
                 self.assertEqual(check_for_updates(clone).status, "up_to_date")
+
+            # Diverged branch (local ahead + remote behind) must set ahead_count > 0 and can_fast_forward=False
+            run(["git", "config", "user.email", "user@example.com"], clone)
+            run(["git", "config", "user.name", "LocalUser"], clone)
+            (clone / "local_only.txt").write_text("local\n", encoding="utf-8")
+            run(["git", "add", "local_only.txt"], clone)
+            run(["git", "commit", "-m", "local commit"], clone)
+            (upstream / "app.txt").write_text("v3\n", encoding="utf-8")
+            run(["git", "commit", "-am", "feat: v3"], upstream)
+            run(["git", "push", "origin", "main"], upstream)
+            r_div = check_for_updates(clone)
+            self.assertEqual(r_div.status, "update_available")
+            self.assertEqual(r_div.ahead_count, 1)
+            self.assertEqual(r_div.behind_count, 1)
+            self.assertFalse(r_div.can_fast_forward)
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows integration")
@@ -620,6 +640,31 @@ class WindowsTests(unittest.TestCase):
                 self.assertIsNotNone(primary)
                 self.assertFalse(primary.isEnabled())
                 dlg.deleteLater()
+
+                # Diverged branch (ahead > 0) also disables primary update button
+                div_res = UpdateCheckResult(
+                    status="update_available",
+                    local_sha="1111111",
+                    remote_sha="2222222",
+                    branch="main",
+                    behind_count=1,
+                    ahead_count=2,
+                    commits=("2222222 feat: new",),
+                    has_local_changes=False,
+                )
+                dlg_div = dialogs.UpdateDialog(div_res, theme="dark", parent=dock)
+                primary_div = dlg_div.findChild(QPushButton, "primaryBtn")
+                self.assertIsNotNone(primary_div)
+                self.assertFalse(primary_div.isEnabled())
+                dlg_div.deleteLater()
+
+                # Ampersands in dynamic project/agent names are escaped to avoid Qt mnemonics
+                dock._agent_windows = {"a1": [{"hwnd": 55, "project": "R&D", "title": "R&D"}]}
+                amenu = dock._build_agent_menu({"id": "a1", "name": "A&B", "type": "exe"})
+                texts = [a.text() for a in amenu.actions() if not a.isSeparator()]
+                self.assertIn("切换到窗口：R&&D", texts)
+                self.assertIn("新开实例：A&&B", texts)
+                amenu.deleteLater()
             finally:
                 dock.close()
                 QThreadPool.globalInstance().waitForDone(3000)

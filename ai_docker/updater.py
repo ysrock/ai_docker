@@ -21,17 +21,25 @@ class UpdateCheckResult:
     local_sha: str = ""
     remote_sha: str = ""
     branch: str = ""
+    remote_ref: str = ""
     behind_count: int = 0
+    ahead_count: int = 0
     commits: tuple[str, ...] = field(default_factory=tuple)
     has_local_changes: bool = False
     message: str = ""
 
+    @property
+    def can_fast_forward(self) -> bool:
+        return (not self.has_local_changes) and self.ahead_count == 0
+
 
 def _run_git(repo_root: Path, *args: str, timeout: float = GIT_TIMEOUT_SEC) -> tuple[int, str, str]:
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     try:
         proc = subprocess.run(
             ["git", *args],
             cwd=str(repo_root),
+            env=env,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -48,8 +56,20 @@ def _run_git(repo_root: Path, *args: str, timeout: float = GIT_TIMEOUT_SEC) -> t
         return -3, "", str(exc)
 
 
+def _resolve_upstream(repo_root: Path, branch: str) -> tuple[str, str, str]:
+    """Return (remote_name, remote_branch, remote_ref) preferring configured @{u}."""
+    rc, upstream, _ = _run_git(
+        repo_root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"
+    )
+    if rc == 0 and "/" in upstream:
+        remote_name, remote_branch = upstream.split("/", 1)
+        if remote_name and remote_branch:
+            return remote_name, remote_branch, upstream
+    return "origin", branch, f"origin/{branch}"
+
+
 def check_for_updates(repo_root: Path = PROJECT_ROOT) -> UpdateCheckResult:
-    """Fetch remote branch metadata and compare local HEAD against origin."""
+    """Fetch remote branch metadata and compare local HEAD against its upstream."""
     if not shutil.which("git"):
         return UpdateCheckResult(
             status="error",
@@ -74,39 +94,49 @@ def check_for_updates(repo_root: Path = PROJECT_ROOT) -> UpdateCheckResult:
     if rc != 0:
         local_sha = ""
 
-    rc, _, err = _run_git(repo_root, "fetch", "--quiet", "origin", branch, timeout=12.0)
+    remote_name, remote_branch, remote_ref = _resolve_upstream(repo_root, branch)
+    rc, _, err = _run_git(repo_root, "fetch", "--quiet", remote_name, remote_branch, timeout=12.0)
     if rc != 0:
         return UpdateCheckResult(
             status="error",
             local_sha=local_sha,
             branch=branch,
+            remote_ref=remote_ref,
             message=err or "拉取远端更新信息失败，请检查网络连接。",
         )
 
-    remote_ref = f"origin/{branch}"
     rc, remote_sha, err = _run_git(repo_root, "rev-parse", "--short", remote_ref)
     if rc != 0:
         return UpdateCheckResult(
             status="error",
             local_sha=local_sha,
             branch=branch,
+            remote_ref=remote_ref,
             message=err or f"远端分支 {remote_ref} 不存在。",
         )
 
-    rc, behind_str, err = _run_git(repo_root, "rev-list", "--count", f"HEAD..{remote_ref}")
+    rc, counts_out, err = _run_git(
+        repo_root, "rev-list", "--left-right", "--count", f"HEAD...{remote_ref}"
+    )
     if rc != 0:
         return UpdateCheckResult(
             status="error",
             local_sha=local_sha,
             remote_sha=remote_sha,
             branch=branch,
+            remote_ref=remote_ref,
             message=err or "无法比较本地与远端提交差异。",
         )
 
-    try:
-        behind_count = int(behind_str or "0")
-    except ValueError:
-        behind_count = 0
+    ahead_count = 0
+    behind_count = 0
+    parts = counts_out.split()
+    if len(parts) == 2:
+        try:
+            ahead_count = int(parts[0])
+            behind_count = int(parts[1])
+        except ValueError:
+            ahead_count = behind_count = 0
 
     rc_dirty, dirty_out, _ = _run_git(repo_root, "status", "--porcelain", "--untracked-files=no")
     has_local_changes = rc_dirty == 0 and bool(dirty_out)
@@ -117,7 +147,9 @@ def check_for_updates(repo_root: Path = PROJECT_ROOT) -> UpdateCheckResult:
             local_sha=local_sha,
             remote_sha=remote_sha,
             branch=branch,
+            remote_ref=remote_ref,
             behind_count=0,
+            ahead_count=ahead_count,
             has_local_changes=has_local_changes,
             message=f"当前已是最新版本（{branch} @ {local_sha}）。",
         )
@@ -132,7 +164,9 @@ def check_for_updates(repo_root: Path = PROJECT_ROOT) -> UpdateCheckResult:
         local_sha=local_sha,
         remote_sha=remote_sha,
         branch=branch,
+        remote_ref=remote_ref,
         behind_count=behind_count,
+        ahead_count=ahead_count,
         commits=commits,
         has_local_changes=has_local_changes,
         message=f"发现 {behind_count} 个新提交（{local_sha} -> {remote_sha}）。",
@@ -213,6 +247,10 @@ class UpdateChecker(QObject):
         self._in_flight = False
         self._pending_non_silent = False
         self._completed.connect(self._deliver, Qt.ConnectionType.QueuedConnection)
+
+    @property
+    def in_flight(self) -> bool:
+        return self._in_flight
 
     def invalidate(self) -> None:
         self._generation += 1

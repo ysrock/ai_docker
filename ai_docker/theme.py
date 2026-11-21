@@ -40,12 +40,6 @@ THEMES: dict[str, dict[str, Any]] = {
         "tick_hover": QColor(209, 213, 219, 150),
         "icon_hover_bg": QColor(255, 255, 255, 22),
         "icon_press_bg": QColor(10, 132, 255, 48),
-        "menu_bg": "#1e2028",
-        "menu_fg": "#f5f5f7",
-        "menu_border": "rgba(255, 255, 255, 38)",
-        "menu_hover": "rgba(10, 132, 255, 185)",
-        "menu_sep": "rgba(255, 255, 255, 24)",
-        "menu_disabled": "rgba(152, 152, 157, 115)",
         "menu_disabled_color": QColor(152, 152, 157, 125),
         "tip_bg": "#1b1d24",
         "tip_fg": "#f5f5f7",
@@ -84,12 +78,6 @@ THEMES: dict[str, dict[str, Any]] = {
         "tick_hover": QColor(60, 60, 67, 150),
         "icon_hover_bg": QColor(15, 23, 42, 14),
         "icon_press_bg": QColor(0, 122, 255, 32),
-        "menu_bg": "#f7f8fb",
-        "menu_fg": "#1d1d1f",
-        "menu_border": "rgba(15, 23, 42, 34)",
-        "menu_hover": "#007aff",
-        "menu_sep": "rgba(15, 23, 42, 20)",
-        "menu_disabled": "rgba(110, 110, 115, 130)",
         "menu_disabled_color": QColor(110, 110, 115, 135),
         "tip_bg": "#fbfbfd",
         "tip_fg": "#1d1d1f",
@@ -179,27 +167,52 @@ class AppleGlassMenu(QMenu):
         )
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setFont(QFont("Microsoft YaHei UI", 9))
+        self._last_layout_key: tuple[bool, bool] | None = None
+        self._apply_menu_metrics(has_checkable=False, has_submenu=False)
+
+    def _apply_menu_metrics(self, *, has_checkable: bool, has_submenu: bool) -> None:
+        key = (has_checkable, has_submenu)
+        if key == self._last_layout_key:
+            return
+        self._last_layout_key = key
+        pad_left = 26 if has_checkable else 14
+        pad_right = 26 if has_submenu else 14
         self.setStyleSheet(
-            """
-            QMenu {
+            f"""
+            QMenu {{
                 background: transparent;
                 border: none;
                 padding: 13px 13px;
                 font-family: "Microsoft YaHei UI", "Segoe UI";
                 font-size: 12px;
-            }
-            QMenu::item {
+            }}
+            QMenu::item {{
                 background: transparent;
                 color: transparent;
-                padding: 6px 28px 6px 26px;
+                padding: 6px {pad_right}px 6px {pad_left}px;
                 margin: 1px 0px;
-            }
-            QMenu::separator {
+            }}
+            QMenu::separator {{
                 height: 9px;
                 background: transparent;
-            }
+            }}
             """
         )
+
+    def _sync_metrics(self) -> None:
+        visible = [a for a in self.actions() if a.isVisible()]
+        self._apply_menu_metrics(
+            has_checkable=any(a.isCheckable() for a in visible),
+            has_submenu=any(a.menu() is not None for a in visible),
+        )
+
+    def sizeHint(self):
+        self._sync_metrics()
+        return super().sizeHint()
+
+    def showEvent(self, event) -> None:
+        self._sync_metrics()
+        super().showEvent(event)
 
     def addMenu(self, *args: Any, **kwargs: Any) -> Any:
         if len(args) == 1 and isinstance(args[0], str) and not kwargs:

@@ -1739,6 +1739,10 @@ class AgentDockWindow(QWidget):
     ) -> None:
         self._show_context_menu(global_pos, agent=agent, target_hwnd=hwnd)
 
+    @staticmethod
+    def _menu_text(text: str) -> str:
+        return text.replace("&", "&&")
+
     def _build_agent_menu(
         self, agent: dict[str, Any], target_hwnd: int | None = None
     ) -> QMenu:
@@ -1746,6 +1750,7 @@ class AgentDockWindow(QWidget):
         menu = AppleGlassMenu(theme=self._theme(), alpha=self._capsule_alpha(), parent=self)
         aid = agent.get("id", "")
         name = agent.get("name", "")
+        safe_name = self._menu_text(name)
         open_wins = self._agent_windows.get(aid, [])
         notif_summary = self._last_notif_map.get(aid, AgentNotificationSummary())
 
@@ -1762,28 +1767,28 @@ class AgentDockWindow(QWidget):
             for w in open_wins[:8]:
                 proj = w.get("project") or w.get("title") or name or "窗口"
                 hwnd = w["hwnd"]
-                act = menu.addAction(f"切换到窗口：{proj}")
+                act = menu.addAction(self._menu_text(f"切换到窗口：{proj}"))
                 act.triggered.connect(
                     lambda checked=False, h=hwnd, a=aid: self._on_window_chip_clicked(h, a)
                 )
             menu.addSeparator()
 
-        new_inst = menu.addAction(f"新开实例：{name}")
+        new_inst = menu.addAction(f"新开实例：{safe_name}")
         new_inst.triggered.connect(lambda: launch_agent(agent, focus_existing=False))
 
         is_released = agent.get("hide_from_taskbar", True) is False
         global_hide = bool(self.config["ui"].get("hide_from_taskbar", True))
         if is_released:
-            rel_act = menu.addAction(f"重新收进悬浮窗：{name}")
+            rel_act = menu.addAction(f"重新收进悬浮窗：{safe_name}")
             if not global_hide:
-                rel_act.setText(f"重新收进悬浮窗：{name}（全局隐藏已关）")
+                rel_act.setText(f"重新收进悬浮窗：{safe_name}（全局隐藏已关）")
                 rel_act.setEnabled(False)
             else:
                 rel_act.triggered.connect(
                     lambda checked=False, a=aid: self._set_agent_released(a, False)
                 )
         else:
-            rel_act = menu.addAction(f"释放到系统任务栏：{name}")
+            rel_act = menu.addAction(f"释放到系统任务栏：{safe_name}")
             rel_act.triggered.connect(
                 lambda checked=False, a=aid: self._set_agent_released(a, True)
             )
@@ -1831,7 +1836,7 @@ class AgentDockWindow(QWidget):
                 )
 
             menu.addSeparator()
-            hide_icon_act = menu.addAction(f"隐藏该图标：{name}")
+            hide_icon_act = menu.addAction(f"隐藏该图标：{safe_name}")
             if visible_count <= 1:
                 hide_icon_act.setEnabled(False)
                 hide_icon_act.setText("隐藏该图标（至少保留 1 个）")
@@ -1886,7 +1891,7 @@ class AgentDockWindow(QWidget):
             item_id = item_agent.get("id", "")
             item_name = item_agent.get("name", item_id)
             is_shown = item_agent.get("enabled", True) is not False
-            act = vis_menu.addAction(item_name)
+            act = vis_menu.addAction(self._menu_text(item_name))
             act.setCheckable(True)
             act.setChecked(is_shown)
             if is_shown and visible_total <= 1:
@@ -1912,7 +1917,7 @@ class AgentDockWindow(QWidget):
             item_id = item_agent.get("id", "")
             item_name = item_agent.get("name", item_id)
             is_rel = item_agent.get("hide_from_taskbar", True) is False
-            act = rel_menu.addAction(item_name)
+            act = rel_menu.addAction(self._menu_text(item_name))
             act.setCheckable(True)
             act.setChecked(is_rel)
             act.triggered.connect(
@@ -1969,13 +1974,17 @@ class AgentDockWindow(QWidget):
         edit_action = system_menu.addAction("打开配置文件 (agents.json)")
         edit_action.triggered.connect(lambda: os.startfile(str(CONFIG_PATH)))
 
-        update_label = (
-            f"发现新更新（{self._available_update.behind_count} 条）..."
-            if self._available_update is not None
-            else "检查更新..."
-        )
-        update_action = system_menu.addAction(update_label)
-        update_action.triggered.connect(self._trigger_check_updates)
+        if self._updater.in_flight:
+            update_action = system_menu.addAction("正在检查更新...")
+            update_action.setEnabled(False)
+        else:
+            update_label = (
+                f"发现新更新（{self._available_update.behind_count} 条）..."
+                if self._available_update is not None
+                else "检查更新..."
+            )
+            update_action = system_menu.addAction(update_label)
+            update_action.triggered.connect(self._trigger_check_updates)
 
         system_menu.addSeparator()
 
@@ -2229,9 +2238,7 @@ class AgentDockWindow(QWidget):
             self._schedule_auto_collapse()
 
     def _trigger_check_updates(self) -> None:
-        if self._available_update is not None:
-            self._open_update_dialog(self._available_update)
-            return
+        # Always run a fresh check so dirty-tree or manual git pull states never stay stale
         self._updater.check_async(silent=False)
 
     def _on_update_check_finished(self, result: UpdateCheckResult, silent: bool) -> None:

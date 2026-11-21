@@ -457,6 +457,13 @@ class UpdateDialog(QDialog):
             warn.setWordWrap(True)
             warn.setStyleSheet("color: #ff453a; font-size: 11px;")
             root.addWidget(warn)
+        elif result.ahead_count > 0:
+            warn = QLabel(
+                f"当前分支比远端超前 {result.ahead_count} 个未推送提交（已分叉），无法快进自动更新，请在终端手动合并。"
+            )
+            warn.setWordWrap(True)
+            warn.setStyleSheet("color: #ff453a; font-size: 11px;")
+            root.addWidget(warn)
         else:
             note = QLabel(
                 "更新会自动拉取代码、按需同步依赖并重启 AI docker，你的本地 agents.json 配置不会被覆盖。"
@@ -473,7 +480,7 @@ class UpdateDialog(QDialog):
 
         update_btn = QPushButton("一键更新并重启")
         update_btn.setObjectName("primaryBtn")
-        update_btn.setEnabled(not result.has_local_changes)
+        update_btn.setEnabled(result.can_fast_forward)
         update_btn.clicked.connect(self.accept)
         btn_row.addWidget(update_btn)
         root.addLayout(btn_row)

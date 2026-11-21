@@ -80,6 +80,7 @@
   - 新增 `ai_docker/updater.py`（`check_for_updates`、`UpdateChecker`、`launch_updater_script`）与根目录 `update.ps1`：启动后延迟 6 秒在后台 `QThreadPool` 静默检查 `origin/<branch>` 是否有新提交，绝不阻塞主线程；有更新时在全局右键菜单“配置与系统”下提示新更新数量。
   - 新增 `UpdateDialog`（`ai_docker/dialogs.py`）展示待拉取的提交日志并拦截未提交源码修改；用户点击“一键更新并重启”后拉起独立分离的 `update.ps1` 并优雅退出当前实例（先还原任务栏图标），随后快进拉取（`git pull --ff-only`，完整保留本地 `agents.json`）、按需 `uv sync` 与重编 `AI docker.exe` 并自动重启。
   - 在 `tests/test_regressions.py` 新增真实本地裸仓库 + `update.ps1` 端到端回归用例与弹窗/菜单联动测试（累计 13 项测试全部通过）。
+  - 审查加固更新器与菜单细节：`update.ps1` 改为 UTF-8 BOM 兼容 Windows PowerShell 5.1、改用 Win32 `FindWindowW` + `WM_CLOSE` 优雅关闭 `Qt.Tool` 窗口、统一 `Invoke-Native` 避免 `uv sync` stderr 误报、GUI 更新失败自动恢复拉起旧实例；`updater.py` 注入 `GIT_TERMINAL_PROMPT=0`、识别 `@{u}` 真实上游与 `ahead_count` 分叉拦截；点击检查更新始终重新拉取避免过期缓存；`AppleGlassMenu` 按是否有勾选栏/子菜单动态对称留白并对动态名称中的 `&` 做转义。
 
 ## 后续规划
 - 支持自定义全局快捷键呼出/切换悬浮窗。
