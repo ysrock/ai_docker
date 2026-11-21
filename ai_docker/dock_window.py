@@ -56,7 +56,7 @@ from .notifications import (
     WindowNotificationState,
 )
 from .taskbar import TaskbarHider
-from .theme import get_palette, paint_apple_glass
+from .theme import AppleGlassMenu, get_palette, paint_apple_glass
 
 user32 = ctypes.windll.user32
 user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
@@ -1428,31 +1428,6 @@ class AgentDockWindow(QWidget):
                 font-family: "Microsoft YaHei UI", "Segoe UI";
                 font-size: 12px;
             }}
-            QMenu {{
-                background-color: {pal['menu_bg']};
-                color: {pal['menu_fg']};
-                border: 1px solid {pal['menu_border']};
-                border-radius: 10px;
-                padding: 5px;
-                font-family: "Microsoft YaHei UI", "Segoe UI";
-                font-size: 12px;
-            }}
-            QMenu::item {{
-                padding: 6px 20px 6px 12px;
-                border-radius: 6px;
-            }}
-            QMenu::item:selected {{
-                background-color: {pal['menu_hover']};
-                color: #ffffff;
-            }}
-            QMenu::item:disabled {{
-                color: {pal['menu_disabled']};
-            }}
-            QMenu::separator {{
-                height: 1px;
-                background: {pal['menu_sep']};
-                margin: 4px 8px;
-            }}
             """
         )
 
@@ -1757,7 +1732,7 @@ class AgentDockWindow(QWidget):
         self, agent: dict[str, Any], target_hwnd: int | None = None
     ) -> QMenu:
         """Context menu scoped strictly to one Agent (or one of its open project windows)."""
-        menu = QMenu(self)
+        menu = AppleGlassMenu(theme=self._theme(), alpha=self._capsule_alpha(), parent=self)
         aid = agent.get("id", "")
         name = agent.get("name", "")
         open_wins = self._agent_windows.get(aid, [])
@@ -1858,7 +1833,7 @@ class AgentDockWindow(QWidget):
 
     def _build_global_menu(self) -> QMenu:
         """Context menu for the drag grip / empty capsule area (global AI docker settings)."""
-        menu = QMenu(self)
+        menu = AppleGlassMenu(theme=self._theme(), alpha=self._capsule_alpha(), parent=self)
 
         discover_act = menu.addAction("扫描本机新安装的 Agent...")
         discover_act.triggered.connect(self._open_discover_dialog)
@@ -1977,6 +1952,7 @@ class AgentDockWindow(QWidget):
         autostart_action.triggered.connect(self._toggle_autostart)
 
         quit_action = menu.addAction("退出 AI docker (还原任务栏图标)")
+        quit_action.setProperty("destructive", True)
         quit_action.triggered.connect(self._quit_app)
 
         return menu

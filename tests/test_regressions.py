@@ -443,3 +443,46 @@ class WindowsTests(unittest.TestCase):
                 dock.close()
                 app.setQuitOnLastWindowClosed(prev_quit_setting)
                 QThreadPool.globalInstance().waitForDone(3000)
+
+    def test_context_menus_and_submenus_use_themed_apple_glass(self):
+        from PySide6.QtCore import QThreadPool, Qt
+        from PySide6.QtWidgets import QApplication
+
+        from ai_docker import dock_window
+        from ai_docker.config import DEFAULT_UI
+        from ai_docker.theme import AppleGlassMenu
+
+        app = QApplication.instance() or QApplication(["regressions", "-platform", "offscreen"])
+        for theme in ("dark", "light"):
+            config = {
+                "ui": {**DEFAULT_UI, "theme": theme, "hide_from_taskbar": False, "auto_collapse": False},
+                "agents": [
+                    {"id": "a1", "name": "Agent 1", "type": "exe", "path": "", "match_process": "a1.exe"},
+                    {"id": "a2", "name": "Agent 2", "type": "exe", "path": "", "match_process": "a2.exe"},
+                ],
+            }
+            with (
+                patch.object(dock_window, "load_config", return_value=config),
+                patch.object(dock_window, "TaskbarHider"),
+                patch.object(dock_window, "NotificationTracker"),
+                patch.object(dock_window, "get_agent_window_map", return_value={}),
+            ):
+                dock = dock_window.AgentDockWindow()
+                dock._status_timer.stop()
+                try:
+                    gmenu = dock._build_global_menu()
+                    amenu = dock._build_agent_menu(config["agents"][0])
+                    for menu in (gmenu, amenu):
+                        self.assertIsInstance(menu, AppleGlassMenu)
+                        self.assertEqual(menu._theme, theme)
+                        self.assertTrue(menu.testAttribute(Qt.WA_TranslucentBackground))
+                        self.assertTrue(bool(menu.windowFlags() & Qt.FramelessWindowHint))
+                        for act in menu.actions():
+                            if act.menu() is not None:
+                                self.assertIsInstance(act.menu(), AppleGlassMenu)
+                                self.assertEqual(act.menu()._theme, theme)
+                    gmenu.deleteLater()
+                    amenu.deleteLater()
+                finally:
+                    dock.close()
+                    QThreadPool.globalInstance().waitForDone(3000)

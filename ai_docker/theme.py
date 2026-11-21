@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import QRectF
-from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath, QPen
+from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPen
+from PySide6.QtWidgets import QMenu, QWidget
 
 THEMES: dict[str, dict[str, Any]] = {
     "dark": {
@@ -45,6 +46,7 @@ THEMES: dict[str, dict[str, Any]] = {
         "menu_hover": "rgba(10, 132, 255, 185)",
         "menu_sep": "rgba(255, 255, 255, 24)",
         "menu_disabled": "rgba(152, 152, 157, 115)",
+        "menu_disabled_color": QColor(152, 152, 157, 125),
         "tip_bg": "#1b1d24",
         "tip_fg": "#f5f5f7",
         "tip_border": "rgba(255, 255, 255, 46)",
@@ -88,6 +90,7 @@ THEMES: dict[str, dict[str, Any]] = {
         "menu_hover": "#007aff",
         "menu_sep": "rgba(15, 23, 42, 20)",
         "menu_disabled": "rgba(110, 110, 115, 130)",
+        "menu_disabled_color": QColor(110, 110, 115, 135),
         "tip_bg": "#fbfbfd",
         "tip_fg": "#1d1d1f",
         "tip_border": "rgba(15, 23, 42, 36)",
@@ -153,3 +156,174 @@ def paint_apple_glass(
         rim_grad.setColorAt(1.0, pal["rim_bot"])
         painter.setPen(QPen(rim_grad, 1.0))
     painter.drawPath(path)
+
+
+class AppleGlassMenu(QMenu):
+    """macOS frosted-glass context menu matching AI docker's dark/light theme & elevation."""
+
+    def __init__(
+        self,
+        title: str = "",
+        *,
+        theme: str = "dark",
+        alpha: int = 232,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(title, parent)
+        self._theme = theme
+        self._alpha = alpha
+        self._shadow_pad = 8
+
+        self.setWindowFlags(
+            self.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFont(QFont("Microsoft YaHei UI", 9))
+        self.setStyleSheet(
+            """
+            QMenu {
+                background: transparent;
+                border: none;
+                padding: 13px 13px;
+                font-family: "Microsoft YaHei UI", "Segoe UI";
+                font-size: 12px;
+            }
+            QMenu::item {
+                background: transparent;
+                color: transparent;
+                padding: 6px 28px 6px 26px;
+                margin: 1px 0px;
+            }
+            QMenu::separator {
+                height: 9px;
+                background: transparent;
+            }
+            """
+        )
+
+    def addMenu(self, *args: Any, **kwargs: Any) -> Any:
+        if len(args) == 1 and isinstance(args[0], str) and not kwargs:
+            sub = AppleGlassMenu(
+                args[0], theme=self._theme, alpha=self._alpha, parent=self
+            )
+            super().addMenu(sub)
+            return sub
+        return super().addMenu(*args, **kwargs)
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.TextAntialiasing, True)
+        pal = get_palette(self._theme)
+
+        pad = float(self._shadow_pad)
+        glass_rect = QRectF(
+            pad, pad, self.width() - pad * 2.0, self.height() - pad * 2.0
+        )
+        paint_apple_glass(
+            painter, glass_rect, radius=13.0, theme=self._theme, alpha=self._alpha
+        )
+
+        visible_actions = [a for a in self.actions() if a.isVisible()]
+        has_checkable = any(a.isCheckable() for a in visible_actions)
+        active = self.activeAction()
+        painter.setFont(self.font())
+
+        for act in visible_actions:
+            rect = self.actionGeometry(act)
+            if rect.isEmpty():
+                continue
+
+            if act.isSeparator():
+                y = float(rect.center().y()) + 0.5
+                painter.setPen(QPen(pal["divider"], 1.0))
+                painter.drawLine(
+                    QPointF(glass_rect.left() + 10.0, y),
+                    QPointF(glass_rect.right() - 10.0, y),
+                )
+                continue
+
+            enabled = act.isEnabled()
+            selected = (act is active) and enabled
+            destructive = bool(act.property("destructive"))
+
+            item_rect = QRectF(
+                glass_rect.left() + 5.0,
+                float(rect.top()) + 1.0,
+                glass_rect.width() - 10.0,
+                float(rect.height()) - 2.0,
+            )
+
+            if selected:
+                hl_color = QColor(pal["alert"] if destructive else pal["accent"])
+                hl_color.setAlpha(235)
+                hl_path = QPainterPath()
+                hl_path.addRoundedRect(item_rect, 7.0, 7.0)
+                painter.fillPath(hl_path, hl_color)
+
+            if act.isCheckable() and act.isChecked():
+                cx = item_rect.left() + 13.0
+                cy = item_rect.center().y()
+                chk = QPainterPath()
+                chk.moveTo(cx - 3.6, cy + 0.3)
+                chk.lineTo(cx - 1.0, cy + 3.0)
+                chk.lineTo(cx + 4.1, cy - 2.9)
+                chk_color = (
+                    QColor("#ffffff")
+                    if selected
+                    else (pal["accent"] if enabled else pal["menu_disabled_color"])
+                )
+                painter.setPen(
+                    QPen(chk_color, 1.75, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+                )
+                painter.setBrush(Qt.NoBrush)
+                painter.drawPath(chk)
+
+            text_left = item_rect.left() + (24.0 if has_checkable else 11.0)
+            has_sub = act.menu() is not None
+            text_right = item_rect.right() - (22.0 if has_sub else 11.0)
+            text_rect = QRectF(
+                text_left,
+                item_rect.top(),
+                max(10.0, text_right - text_left),
+                item_rect.height(),
+            )
+            if selected:
+                text_color = QColor("#ffffff")
+            elif not enabled:
+                text_color = pal["menu_disabled_color"]
+            elif destructive:
+                text_color = pal["alert"]
+            else:
+                text_color = pal["text_primary"]
+            painter.setPen(text_color)
+            display_text = painter.fontMetrics().elidedText(
+                act.text().replace("&&", "&"),
+                Qt.ElideRight,
+                int(text_rect.width()),
+            )
+            painter.drawText(
+                text_rect,
+                Qt.AlignVCenter | Qt.AlignLeft | Qt.TextSingleLine,
+                display_text,
+            )
+
+            if has_sub:
+                ax = item_rect.right() - 11.0
+                ay = item_rect.center().y()
+                chev = QPainterPath()
+                chev.moveTo(ax - 1.8, ay - 3.6)
+                chev.lineTo(ax + 1.9, ay)
+                chev.lineTo(ax - 1.8, ay + 3.6)
+                chev_color = (
+                    QColor("#ffffff")
+                    if selected
+                    else (pal["text_header"] if enabled else pal["menu_disabled_color"])
+                )
+                painter.setPen(
+                    QPen(chev_color, 1.45, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+                )
+                painter.setBrush(Qt.NoBrush)
+                painter.drawPath(chev)
+
+        painter.end()

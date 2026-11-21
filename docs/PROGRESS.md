@@ -73,6 +73,8 @@
 - **交互边界与内存释放修复**：
   - `ai_docker/dock_window.py` 修复手动点击“立即收缩为悬浮图标”后因菜单关闭立即 `enterEvent` 弹回的问题（450ms 冷却，移出即复位）；修复靠右锚点启动或增删图标时展开态出屏问题；为扫描/添加弹窗补充 `deleteLater()` 与 `DiscoverAgentsDialog` 关闭时 `invalidate()`；统一封装 `_persist_config()` 容错处理文件占用异常。
   - 修复关闭扫描/添加弹窗或 `QMessageBox` 导致 `AI docker` 整体退出的严重缺陷：`main.py` 改为 `app.setQuitOnLastWindowClosed(False)`（因 `AgentDockWindow` 使用 `Qt.Tool` 不计入 Qt 非工具窗口计数），并在 `AgentDockWindow.closeEvent()` 显式退出事件循环；通过弹窗新增 Agent 后若处于收缩态自动展开以即时展示新图标。
+- **右键菜单 macOS 毛玻璃主题统一**：
+  - 在 `ai_docker/theme.py` 新增 `AppleGlassMenu(QMenu)`，启用无边框透明窗口并直接复用 `paint_apple_glass` 绘制圆角毛玻璃面板与多层投影（彻底消除 Windows 原生 `QMenu` 的直角黑/灰底边），同步自绘抗锯齿苹果蓝勾选对勾、子菜单右箭头、发丝分隔线与退出项红色警示样式，所有嵌套子菜单自动继承深/浅双主题与透明度。
 
 ## 后续规划
 - 支持自定义全局快捷键呼出/切换悬浮窗。
