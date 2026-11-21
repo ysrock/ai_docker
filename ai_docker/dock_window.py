@@ -228,23 +228,43 @@ def paint_apple_glass(
 
 
 class DragGrip(QWidget):
-    """Subtle Apple-minimal drag handle at the left edge of Row 1."""
+    """Dedicated Apple-minimal drag handle at the left edge of Row 1 to move the whole dock."""
 
     def __init__(self, height: int = 46, theme: str = "dark", parent: QWidget | None = None):
         super().__init__(parent)
         self._theme = theme
+        self._hovered = False
         self.setCursor(Qt.SizeAllCursor)
-        self.setToolTip("按住拖动悬浮窗位置")
+        self.setToolTip("按住拖动整个悬浮窗位置")
         self.setFixedSize(16, height)
 
     def set_theme(self, theme: str) -> None:
         self._theme = theme
         self.update()
 
+    def enterEvent(self, event) -> None:
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setBrush(get_palette(self._theme)["grip"])
+        pal = get_palette(self._theme)
+
+        if self._hovered:
+            bg = QRectF(1.0, 6.0, self.width() - 2.0, self.height() - 12.0)
+            path = QPainterPath()
+            path.addRoundedRect(bg, 6.0, 6.0)
+            painter.fillPath(path, pal["icon_hover_bg"])
+
+        dot_color = pal["text_header_hover"] if self._hovered else pal["grip"]
+        painter.setBrush(dot_color)
         painter.setPen(Qt.NoPen)
 
         r = 1.35
@@ -286,7 +306,7 @@ class AgentIconButton(QWidget):
         self._has_alert = False
         self._notif_text = ""
         self._press_global: QPoint | None = None
-        self._dragging_parent = False
+        self._reordering = False
 
         # Smooth magnification animation state
         self._scale = 1.0
@@ -375,7 +395,7 @@ class AgentIconButton(QWidget):
         if event.button() == Qt.LeftButton:
             self._pressed = True
             self._press_global = event.globalPosition().toPoint()
-            self._dragging_parent = False
+            self._reordering = False
             self.update()
             event.accept()
             return
@@ -386,39 +406,42 @@ class AgentIconButton(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
-        # Feed cursor position to parent TopDockCapsule for smooth wave magnification
         parent_bar = self.parentWidget()
-        if isinstance(parent_bar, TopDockCapsule):
-            parent_bar.update_wave_from_global(event.globalPosition().toPoint())
+        cur_global = event.globalPosition().toPoint()
 
-        if self._pressed and self._press_global is not None and (event.buttons() & Qt.LeftButton):
-            cur = event.globalPosition().toPoint()
-            if not self._dragging_parent and (cur - self._press_global).manhattanLength() > 6:
-                self._dragging_parent = True
+        if self._press_global is not None and (event.buttons() & Qt.LeftButton):
+            if not self._reordering and (cur_global - self._press_global).manhattanLength() > 8:
+                self._reordering = True
                 self._pressed = False
+                self.setCursor(Qt.ClosedHandCursor)
                 self.update()
-                win = self.window()
-                if isinstance(win, AgentDockWindow):
-                    win.begin_external_drag(cur)
-            if self._dragging_parent:
-                win = self.window()
-                if isinstance(win, AgentDockWindow):
-                    win.update_external_drag(cur)
+                if isinstance(parent_bar, TopDockCapsule):
+                    parent_bar.begin_reorder(self)
+            if self._reordering:
+                if isinstance(parent_bar, TopDockCapsule):
+                    parent_bar.update_reorder(cur_global)
+                event.accept()
+                return
             event.accept()
             return
+
+        # Normal hover: feed cursor position to parent TopDockCapsule for smooth wave magnification
+        if isinstance(parent_bar, TopDockCapsule):
+            parent_bar.update_wave_from_global(cur_global)
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
-            was_dragging = self._dragging_parent
-            self._dragging_parent = False
+            was_reordering = self._reordering
+            self._reordering = False
             self._pressed = False
             self._press_global = None
+            self.setCursor(Qt.PointingHandCursor)
             self.update()
-            if was_dragging:
-                win = self.window()
-                if isinstance(win, AgentDockWindow):
-                    win.end_external_drag()
+            if was_reordering:
+                parent_bar = self.parentWidget()
+                if isinstance(parent_bar, TopDockCapsule):
+                    parent_bar.finish_reorder()
             elif self.rect().contains(event.position().toPoint()):
                 self.clicked.emit(self.agent)
             event.accept()
@@ -431,7 +454,16 @@ class AgentIconButton(QWidget):
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         pal = get_palette(self._theme)
 
-        if self._pressed or self._hovered:
+        if self._reordering:
+            bg_rect = QRectF(2.0, 5.0, self.width() - 4.0, self.height() - 10.0)
+            path = QPainterPath()
+            path.addRoundedRect(bg_rect, 11.0, 11.0)
+            painter.fillPath(path, pal["icon_press_bg"])
+            pen = QPen(pal["accent"], 1.2, Qt.DashLine)
+            painter.setPen(pen)
+            painter.drawPath(path)
+            painter.setOpacity(0.5)
+        elif self._pressed or self._hovered:
             bg_rect = QRectF(2.0, 5.0, self.width() - 4.0, self.height() - 10.0)
             path = QPainterPath()
             path.addRoundedRect(bg_rect, 11.0, 11.0)
@@ -486,7 +518,9 @@ class AgentIconButton(QWidget):
 
 
 class TopDockCapsule(QWidget):
-    """Row 1: evenly-spaced Apple glass Dock bar with 60fps wave magnification."""
+    """Row 1: evenly-spaced Apple glass Dock bar with 60fps wave magnification & drag reorder."""
+
+    reorder_requested = Signal(str, int)
 
     def __init__(self, theme: str = "dark", alpha: int = 232, parent: QWidget | None = None):
         super().__init__(parent)
@@ -495,6 +529,8 @@ class TopDockCapsule(QWidget):
         self._shadow_pad = 7
         self._drop_highlight = False
         self._icon_buttons: list[AgentIconButton] = []
+        self._reordering_btn: AgentIconButton | None = None
+        self._insert_slot: int | None = None
 
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setMouseTracking(True)
@@ -526,8 +562,52 @@ class TopDockCapsule(QWidget):
 
     def set_icon_buttons(self, buttons: list[AgentIconButton]) -> None:
         self._icon_buttons = buttons
+        self._reordering_btn = None
+        self._insert_slot = None
+
+    def begin_reorder(self, btn: AgentIconButton) -> None:
+        self._reordering_btn = btn
+        self.reset_wave()
+        try:
+            self._insert_slot = self._icon_buttons.index(btn)
+        except ValueError:
+            self._insert_slot = None
+        self.update()
+
+    def update_reorder(self, global_pos: QPoint) -> None:
+        if self._reordering_btn is None or not self._icon_buttons:
+            return
+        local_x = self.mapFromGlobal(global_pos).x()
+        slot = len(self._icon_buttons)
+        for idx, btn in enumerate(self._icon_buttons):
+            center_x = btn.x() + btn.width() / 2.0
+            if local_x < center_x:
+                slot = idx
+                break
+        if slot != self._insert_slot:
+            self._insert_slot = slot
+            self.update()
+
+    def finish_reorder(self) -> None:
+        btn = self._reordering_btn
+        slot = self._insert_slot
+        self._reordering_btn = None
+        self._insert_slot = None
+        self.update()
+
+        if btn is None or slot is None or btn not in self._icon_buttons:
+            return
+        src_idx = self._icon_buttons.index(btn)
+        target_idx = slot if slot <= src_idx else slot - 1
+        target_idx = max(0, min(len(self._icon_buttons) - 1, target_idx))
+        if target_idx != src_idx:
+            aid = btn.agent.get("id", "")
+            if aid:
+                self.reorder_requested.emit(aid, target_idx)
 
     def update_wave_from_global(self, global_pos: QPoint) -> None:
+        if self._reordering_btn is not None:
+            return
         local_x = self.mapFromGlobal(global_pos).x()
         radius = 96.0
         for btn in self._icon_buttons:
@@ -556,12 +636,28 @@ class TopDockCapsule(QWidget):
             self._anim_timer.stop()
 
     def mouseMoveEvent(self, event) -> None:
-        self.update_wave_from_global(event.globalPosition().toPoint())
+        if self._reordering_btn is not None:
+            self.update_reorder(event.globalPosition().toPoint())
+        else:
+            self.update_wave_from_global(event.globalPosition().toPoint())
         super().mouseMoveEvent(event)
 
     def leaveEvent(self, event) -> None:
-        self.reset_wave()
+        if self._reordering_btn is None:
+            self.reset_wave()
         super().leaveEvent(event)
+
+    def _indicator_x_for_slot(self, slot: int) -> float | None:
+        if not self._icon_buttons:
+            return None
+        if slot <= 0:
+            return float(self._icon_buttons[0].x()) - 3.0
+        if slot >= len(self._icon_buttons):
+            last = self._icon_buttons[-1]
+            return float(last.x() + last.width()) + 3.0
+        left_btn = self._icon_buttons[slot - 1]
+        right_btn = self._icon_buttons[slot]
+        return (left_btn.x() + left_btn.width() + right_btn.x()) / 2.0
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
@@ -576,6 +672,21 @@ class TopDockCapsule(QWidget):
             alpha=self._alpha,
             drop_highlight=self._drop_highlight,
         )
+
+        # Draw glowing Apple Blue insertion bar while dragging an icon to reorder
+        if self._reordering_btn is not None and self._insert_slot is not None:
+            ix = self._indicator_x_for_slot(self._insert_slot)
+            if ix is not None:
+                pal = get_palette(self._theme)
+                bar_h = max(24.0, rect.height() - 16.0)
+                by = rect.top() + (rect.height() - bar_h) / 2.0
+                accent = pal["accent"]
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(accent.red(), accent.green(), accent.blue(), 85))
+                painter.drawRoundedRect(QRectF(ix - 3.0, by - 1.0, 6.0, bar_h + 2.0), 3.0, 3.0)
+                painter.setBrush(accent)
+                painter.drawRoundedRect(QRectF(ix - 1.4, by, 2.8, bar_h), 1.4, 1.4)
+
         painter.end()
 
 
@@ -946,6 +1057,7 @@ class AgentDockWindow(QWidget):
 
         theme = self._theme()
         self._top_bar = TopDockCapsule(theme=theme, alpha=self._capsule_alpha(), parent=self)
+        self._top_bar.reorder_requested.connect(self._move_agent_to_visible_index)
         self._grip = DragGrip(
             height=int(self.config["ui"].get("button_size", 46)),
             theme=theme,
@@ -1366,9 +1478,38 @@ class AgentDockWindow(QWidget):
             new_inst.triggered.connect(lambda: launch_agent(agent, focus_existing=False))
 
             if target_hwnd is None:
-                visible_count = sum(
-                    1 for a in self.config.get("agents", []) if a.get("enabled", True) is not False
-                )
+                visible_ids = [
+                    a.get("id", "")
+                    for a in self.config.get("agents", [])
+                    if a.get("enabled", True) is not False
+                ]
+                visible_count = len(visible_ids)
+                cur_vis_idx = visible_ids.index(aid) if aid in visible_ids else -1
+
+                if visible_count > 1 and cur_vis_idx >= 0:
+                    move_menu = menu.addMenu("调整位置（也可直接左键左右拖动）")
+                    act_left = move_menu.addAction("向左移一位")
+                    act_left.setEnabled(cur_vis_idx > 0)
+                    act_left.triggered.connect(
+                        lambda checked=False, a=aid: self._shift_agent(a, -1)
+                    )
+                    act_right = move_menu.addAction("向右移一位")
+                    act_right.setEnabled(cur_vis_idx < visible_count - 1)
+                    act_right.triggered.connect(
+                        lambda checked=False, a=aid: self._shift_agent(a, 1)
+                    )
+                    move_menu.addSeparator()
+                    act_first = move_menu.addAction("移到最左")
+                    act_first.setEnabled(cur_vis_idx > 0)
+                    act_first.triggered.connect(
+                        lambda checked=False, a=aid: self._move_agent_to_visible_index(a, 0)
+                    )
+                    act_last = move_menu.addAction("移到最右")
+                    act_last.setEnabled(cur_vis_idx < visible_count - 1)
+                    act_last.triggered.connect(
+                        lambda checked=False, a=aid, last=visible_count - 1: self._move_agent_to_visible_index(a, last)
+                    )
+
                 hide_icon_act = menu.addAction(f"隐藏该图标：{agent.get('name', '')}")
                 if visible_count <= 1:
                     hide_icon_act.setEnabled(False)
@@ -1485,6 +1626,39 @@ class AgentDockWindow(QWidget):
         self._rebuild_dock(force_refresh_icons=False)
         self.move(top_left)
         self._refresh_state()
+
+    def _move_agent_to_visible_index(self, agent_id: str, new_visible_idx: int) -> None:
+        agents = self.config.get("agents", [])
+        visible_slots = [i for i, a in enumerate(agents) if a.get("enabled", True) is not False]
+        visible_items = [agents[i] for i in visible_slots]
+
+        cur_vis_idx = next(
+            (i for i, a in enumerate(visible_items) if a.get("id") == agent_id), -1
+        )
+        if cur_vis_idx < 0:
+            return
+        clamped = max(0, min(len(visible_items) - 1, int(new_visible_idx)))
+        if clamped == cur_vis_idx:
+            return
+
+        moved = visible_items.pop(cur_vis_idx)
+        visible_items.insert(clamped, moved)
+        for slot_idx, item in zip(visible_slots, visible_items):
+            agents[slot_idx] = item
+
+        save_config(self.config)
+        top_left = self.pos()
+        self._rebuild_dock(force_refresh_icons=False)
+        self.move(top_left)
+        self._refresh_state()
+
+    def _shift_agent(self, agent_id: str, delta: int) -> None:
+        agents = self.config.get("agents", [])
+        visible_ids = [a.get("id", "") for a in agents if a.get("enabled", True) is not False]
+        if agent_id not in visible_ids:
+            return
+        cur_idx = visible_ids.index(agent_id)
+        self._move_agent_to_visible_index(agent_id, cur_idx + delta)
 
     def _set_agent_visible(self, agent_id: str, visible: bool) -> None:
         agents = self.config.get("agents", [])
