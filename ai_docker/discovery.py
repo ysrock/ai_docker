@@ -32,6 +32,8 @@ DESKTOP_KEYWORDS = (
     "kimi",
     "qoder",
     "zed",
+    "visual studio code",
+    "vs code",
 )
 
 SKIP_EXE_NAMES = (

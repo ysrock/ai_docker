@@ -37,15 +37,15 @@ kernel32.QueryFullProcessImageNameW.argtypes = [
 kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
 
 
-def _get_process_basename(pid: int) -> str:
+def _get_process_path(pid: int) -> str:
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         return ""
     try:
-        buf_len = wintypes.DWORD(1024)
+        buf_len = wintypes.DWORD(32768)
         buf = ctypes.create_unicode_buffer(buf_len.value)
         if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(buf_len)):
-            return os.path.basename(buf.value)
+            return buf.value
         return ""
     finally:
         kernel32.CloseHandle(handle)
@@ -80,15 +80,16 @@ def list_visible_windows() -> list[dict[str, Any]]:
         _, pid = win32process.GetWindowThreadProcessId(hwnd)
         if pid == OWN_PID:
             return True
-        proc_name = pid_cache.get(pid)
-        if proc_name is None:
-            proc_name = _get_process_basename(pid)
-            pid_cache[pid] = proc_name
+        process_path = pid_cache.get(pid)
+        if process_path is None:
+            process_path = _get_process_path(pid)
+            pid_cache[pid] = process_path
         windows.append(
             {
                 "hwnd": hwnd,
                 "pid": pid,
-                "process": proc_name,
+                "process": os.path.basename(process_path),
+                "process_path": process_path,
                 "title": title,
             }
         )
@@ -192,17 +193,60 @@ def extract_project_name(agent: dict[str, Any], raw_title: str) -> str:
     return candidate
 
 
+def _canonical_path(path_str: str) -> str:
+    """Normalize a Windows path, resolving junctions/symlinks/8.3 names when it exists."""
+    norm = os.path.normpath(path_str)
+    try:
+        if os.path.exists(norm):
+            norm = os.path.realpath(norm)
+    except OSError:
+        pass
+    return os.path.normcase(os.path.normpath(norm))
+
+
+def _matches_executable_path(exe_path: str, process_path: str) -> bool:
+    """Compare configured exe_path against a running window's process_path.
+
+    Handles junctions/symlinks/short paths and Squirrel versioned launchers
+    (e.g. App\\Foo.exe launching App\\app-1.2.3\\Foo.exe).
+    """
+    if not process_path:
+        return False
+    expected = _canonical_path(exe_path)
+    actual = _canonical_path(process_path)
+    if actual == expected:
+        return True
+    exp_dir, exp_name = os.path.split(expected)
+    act_dir, act_name = os.path.split(actual)
+    if act_name == exp_name:
+        parent_dir, sub_dir = os.path.split(act_dir)
+        if parent_dir == exp_dir and sub_dir.startswith("app-"):
+            return True
+    return False
+
+
 def match_agent_windows(agent: dict[str, Any], windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     match_process = (agent.get("match_process") or "").strip().lower()
     match_title = (agent.get("match_title") or "").strip().lower()
     if not match_process and not match_title:
         return []
 
+    # Discovered and manually added executables share this config shape, including old entries.
+    exe_path = agent.get("path") or ""
+    use_match_path = (
+        agent.get("type", "exe") == "exe"
+        and agent.get("match_path", True) is not False
+        and os.path.isabs(exe_path)
+        and os.path.basename(exe_path).lower() == match_process
+    )
+
     matched: list[dict[str, Any]] = []
     for w in windows:
         proc = w["process"].lower()
         title = w["title"].lower()
         if match_process and proc != match_process:
+            continue
+        if use_match_path and not _matches_executable_path(exe_path, w.get("process_path") or ""):
             continue
         if match_title and match_title not in title:
             continue

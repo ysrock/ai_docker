@@ -4,14 +4,17 @@ import ctypes
 import hashlib
 import io
 import os
+import tempfile
+import time
 import urllib.request
+from collections.abc import Callable
 from ctypes import wintypes
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 from PIL import Image
-from PySide6.QtCore import QRect, QRectF, Qt
+from PySide6.QtCore import QObject, QRect, QRectF, QRunnable, Qt, QThreadPool, Signal, Slot
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
 
 from .config import CACHE_DIR
@@ -340,27 +343,32 @@ def find_msix_icon(aumid: str, theme: str = "dark") -> Path | None:
 
 
 def fetch_web_icon_to_png(url: str, force: bool = False) -> Path | None:
-    parsed = urlparse(url)
-    host = parsed.netloc or parsed.path
-    if not host:
+    try:
+        parsed = urlparse(url)
+        if not parsed.scheme:
+            parsed = urlparse(f"https://{url.lstrip('/')}")
+        hostname, port = parsed.hostname, parsed.port
+    except ValueError:
         return None
-    cache_file = _cache_key("web", host)
-    if cache_file.exists() and not force:
-        return cache_file
+    if parsed.scheme not in ("http", "https") or not hostname:
+        return None
 
-    scheme = parsed.scheme.lower()
-    if scheme and scheme not in ("http", "https"):
-        return None
-    scheme = scheme or "https"
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    if port is not None:
+        host = f"{host}:{port}"
     candidates = [
-        f"https://www.google.com/s2/favicons?domain={host}&sz=128",
-        f"{scheme}://{host}/apple-touch-icon.png",
-        f"{scheme}://{host}/favicon.ico",
+        f"{parsed.scheme}://{host}/apple-touch-icon.png",
+        f"{parsed.scheme}://{host}/favicon.ico",
     ]
+    cache_key = host
     if url.lower().startswith(("http://", "https://")) and url.lower().endswith(
         (".png", ".ico", ".jpg", ".jpeg", ".webp")
     ):
-        candidates.insert(0, url)
+        cache_key = parsed._replace(netloc=host, fragment="").geturl()
+        candidates.insert(0, cache_key)
+    cache_file = _cache_key("web", cache_key)
+    if cache_file.exists() and not force:
+        return cache_file
 
     headers = {
         "User-Agent": (
@@ -371,8 +379,13 @@ def fetch_web_icon_to_png(url: str, force: bool = False) -> Path | None:
     for cand in candidates:
         try:
             req = urllib.request.Request(cand, headers=headers)
+            deadline = time.monotonic() + 2.0
             with urllib.request.urlopen(req, timeout=2.0) as resp:
-                data = resp.read()
+                data = bytearray()
+                while chunk := resp.read1(65536):
+                    data.extend(chunk)
+                    if len(data) > 2 * 1024 * 1024 or time.monotonic() >= deadline:
+                        raise ValueError("Icon download exceeded its limit")
             if not data:
                 continue
             with Image.open(io.BytesIO(data)) as img:
@@ -380,11 +393,84 @@ def fetch_web_icon_to_png(url: str, force: bool = False) -> Path | None:
                 # Skip tiny 16x16 blank placeholders if larger source exists
                 if rgba.width < 24 and cand != candidates[-1]:
                     continue
-                rgba.save(cache_file, format="PNG")
+                # Other workers may read the same cache entry while it is being refreshed.
+                with tempfile.NamedTemporaryFile(dir=cache_file.parent, delete=False) as temporary:
+                    temporary_path = Path(temporary.name)
+                try:
+                    rgba.save(temporary_path, format="PNG")
+                    temporary_path.replace(cache_file)
+                finally:
+                    temporary_path.unlink(missing_ok=True)
                 return cache_file
         except Exception:
             continue
     return None
+
+
+class _WebIconRequest(QRunnable):
+    def __init__(self, url: str, force: bool, generation: int, complete: Callable[..., None]) -> None:
+        super().__init__()
+        self.url = url
+        self.force = force
+        self.generation = generation
+        self.complete = complete
+
+    def run(self) -> None:
+        try:
+            path = fetch_web_icon_to_png(self.url, self.force)
+        except Exception:
+            path = None
+        try:
+            self.complete(self.generation, self.url, path)
+        except RuntimeError:
+            # The owning widget can close while a request is in progress.
+            pass
+
+
+class WebIconLoader(QObject):
+    """Resolve web icon files in workers and deliver paths back to the GUI thread."""
+
+    ready = Signal(str)
+    _downloaded = Signal(int, str, object)
+
+    def __init__(self, parent: QObject) -> None:
+        super().__init__(parent)
+        self._generation = 0
+        self._paths: dict[str, Path | None] = {}
+        self._in_flight: set[str] = set()
+        self._deferred: dict[str, bool] = {}
+        self._downloaded.connect(self._store_path, Qt.ConnectionType.QueuedConnection)
+
+    def invalidate(self) -> None:
+        self._generation += 1
+        self._paths.clear()
+        self._deferred.clear()
+
+    def resolve(self, url: str, force: bool = False) -> Path | None:
+        if url not in self._paths:
+            self._paths[url] = None
+            if url in self._in_flight:
+                self._deferred[url] = force
+            else:
+                self._start(url, force)
+        return self._paths[url]
+
+    def _start(self, url: str, force: bool) -> None:
+        self._in_flight.add(url)
+        request = _WebIconRequest(url, force, self._generation, self._downloaded.emit)
+        QThreadPool.globalInstance().start(request)
+
+    @Slot(int, str, object)
+    def _store_path(self, generation: int, url: str, path: Path | None) -> None:
+        self._in_flight.remove(url)
+        if generation != self._generation:
+            if url in self._deferred:
+                self._start(url, self._deferred.pop(url))
+        elif path is None:
+            self._paths.pop(url, None)
+        else:
+            self._paths[url] = path
+            self.ready.emit(url)
 
 
 def _make_monogram_pixmap(name: str, size: int = 64, accent: str | None = None) -> QPixmap:
@@ -479,7 +565,11 @@ def _apply_cli_badge(pm: QPixmap) -> QPixmap:
 
 
 def load_agent_icon(
-    agent: dict[str, Any], force_refresh: bool = False, theme: str = "dark"
+    agent: dict[str, Any],
+    force_refresh: bool = False,
+    theme: str = "dark",
+    *,
+    resolve_web_icon: Callable[[str, bool], Path | None] | None = None,
 ) -> QIcon:
     """Resolve the crispest real icon for an agent (exe/lnk, msix, web, or explicit path)."""
     pm: QPixmap | None = None
@@ -494,14 +584,14 @@ def load_agent_icon(
     # 2. Explicit icon_source (can be exe, aumid, or url)
     icon_src = agent.get("icon_source")
     if pm is None and icon_src:
-        if "!" in icon_src and not Path(icon_src).exists():
+        if icon_src.lower().startswith(("http://", "https://")):
+            web_png = resolve_web_icon(icon_src, force_refresh) if resolve_web_icon else None
+            if web_png:
+                pm = QPixmap(str(web_png))
+        elif "!" in icon_src and not Path(icon_src).exists():
             msix_png = find_msix_icon(icon_src, theme=theme)
             if msix_png:
                 pm = QPixmap(str(msix_png))
-        elif icon_src.startswith(("http://", "https://")):
-            web_png = fetch_web_icon_to_png(icon_src, force=force_refresh)
-            if web_png:
-                pm = QPixmap(str(web_png))
         elif Path(icon_src).exists():
             if Path(icon_src).suffix.lower() in (".png", ".ico", ".svg", ".jpg", ".webp"):
                 pm = QPixmap(icon_src)
@@ -521,8 +611,8 @@ def load_agent_icon(
             msix_png = find_msix_icon(agent["aumid"], theme=theme)
             if msix_png:
                 pm = QPixmap(str(msix_png))
-        elif atype == "web" and agent.get("url"):
-            web_png = fetch_web_icon_to_png(agent["url"], force=force_refresh)
+        elif atype == "web" and agent.get("url") and resolve_web_icon:
+            web_png = resolve_web_icon(agent["url"], force_refresh)
             if web_png:
                 pm = QPixmap(str(web_png))
         elif atype == "cli":

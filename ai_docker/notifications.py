@@ -5,6 +5,7 @@ import re
 import sqlite3
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from itertools import count
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,17 @@ class AgentNotificationSummary:
     has_alert: bool = False
     latest_text: str = ""
     by_hwnd: dict[int, WindowNotificationState] = field(default_factory=dict)
+    latest_event_order: int = 0
+
+
+@dataclass(frozen=True)
+class _Toast:
+    count: int = 0
+    order: int = 0
+    text: str = ""
+
+
+_NO_TOAST = _Toast()
 
 
 def parse_title_unread_count(title: str) -> int:
@@ -89,12 +101,13 @@ class NotificationTracker:
     def __init__(self, db_path: Path = WPN_DB_PATH) -> None:
         self._db_path = db_path
         self._last_toast_id: int = self._read_max_notification_id()
-        self._flashing_hwnds: set[int] = set()
-        self._window_toast_counts: dict[int, int] = {}
-        self._window_toast_texts: dict[int, str] = {}
-        self._agent_toast_counts: dict[str, int] = {}
-        self._agent_toast_texts: dict[str, str] = {}
-        self._last_active_badges: dict[str, int] = {}
+        self._event_orders = count(1)
+        self._flashing_hwnds: dict[int, int] = {}
+        self._window_toasts: dict[int, _Toast] = {}
+        self._agent_toasts: dict[str, _Toast] = {}
+        self._title_alerts: dict[int, tuple[int, int]] = {}
+        self._dismissed_title_counts: dict[int, int] = {}
+        self._badge_alerts: dict[str, tuple[int, int]] = {}
         self._dismissed_badge_counts: dict[str, int] = {}
 
     def _connect_ro(self) -> sqlite3.Connection | None:
@@ -120,43 +133,41 @@ class NotificationTracker:
             conn.close()
 
     def on_shell_flash(self, hwnd: int, foreground_hwnd: int = 0) -> None:
-        if hwnd and hwnd != foreground_hwnd:
-            self._flashing_hwnds.add(hwnd)
+        if hwnd and hwnd != foreground_hwnd and hwnd not in self._flashing_hwnds:
+            self._flashing_hwnds[hwnd] = next(self._event_orders)
 
     def clear_window(self, hwnd: int, agent_id: str | None = None) -> None:
-        self._flashing_hwnds.discard(hwnd)
-        self._window_toast_counts.pop(hwnd, None)
-        self._window_toast_texts.pop(hwnd, None)
+        self._flashing_hwnds.pop(hwnd, None)
+        self._window_toasts.pop(hwnd, None)
+        title_count, _ = self._title_alerts.get(hwnd, (0, 0))
+        if title_count:
+            self._dismissed_title_counts[hwnd] = title_count
         if agent_id:
-            self._agent_toast_counts.pop(agent_id, None)
-            self._agent_toast_texts.pop(agent_id, None)
-            cur_badge = self._last_active_badges.get(agent_id, 0)
-            if cur_badge > 0:
-                self._dismissed_badge_counts[agent_id] = cur_badge
+            self.clear_agent(agent_id)
 
-    def clear_agent(self, agent_id: str, hwnds: list[int] | None = None) -> None:
-        self._agent_toast_counts.pop(agent_id, None)
-        self._agent_toast_texts.pop(agent_id, None)
-        cur_badge = self._last_active_badges.get(agent_id, 0)
+    def clear_agent_unattributed(self, agent_id: str) -> None:
+        """Clear agent-level unattributed toasts and dismiss current Windows badge without clearing per-window alerts."""
+        self._agent_toasts.pop(agent_id, None)
+        cur_badge, _ = self._badge_alerts.get(agent_id, (0, 0))
         if cur_badge > 0:
             self._dismissed_badge_counts[agent_id] = cur_badge
-        if hwnds:
-            for h in hwnds:
-                self._flashing_hwnds.discard(h)
-                self._window_toast_counts.pop(h, None)
-                self._window_toast_texts.pop(h, None)
+
+    def clear_agent(self, agent_id: str, hwnds: list[int] | None = None) -> None:
+        self.clear_agent_unattributed(agent_id)
+        for hwnd in hwnds or ():
+            self.clear_window(hwnd)
 
     def _poll_wpn_db(
         self,
         agents: list[dict[str, Any]],
         agent_windows: dict[str, list[dict[str, Any]]],
         foreground_hwnd: int,
-    ) -> dict[str, int]:
+    ) -> dict[str, int] | None:
         """Poll new toasts since watermark and active badge rows. Returns active badge counts per agent."""
         active_badges: dict[str, int] = {}
         conn = self._connect_ro()
         if conn is None:
-            return active_badges
+            return None
 
         # Map lowercase handler PrimaryId -> list of matching agents
         handler_to_agents: dict[str, list[dict[str, Any]]] = {}
@@ -211,6 +222,8 @@ class NotificationTracker:
                     continue
                 text = _extract_toast_text(payload)
                 text_low = text.lower()
+                order = next(self._event_orders)
+                notified_windows: set[int] = set()
 
                 for ag in matched_agents:
                     aid = ag.get("id", "")
@@ -229,17 +242,15 @@ class NotificationTracker:
                         continue
 
                     if target_hwnd:
-                        self._window_toast_counts[target_hwnd] = (
-                            self._window_toast_counts.get(target_hwnd, 0) + 1
-                        )
-                        if text:
-                            self._window_toast_texts[target_hwnd] = text
+                        if target_hwnd not in notified_windows:
+                            previous = self._window_toasts.get(target_hwnd, _NO_TOAST)
+                            self._window_toasts[target_hwnd] = _Toast(previous.count + 1, order, text)
+                            notified_windows.add(target_hwnd)
                     else:
-                        self._agent_toast_counts[aid] = self._agent_toast_counts.get(aid, 0) + 1
-                        if text:
-                            self._agent_toast_texts[aid] = text
+                        previous = self._agent_toasts.get(aid, _NO_TOAST)
+                        self._agent_toasts[aid] = _Toast(previous.count + 1, order, text)
         except Exception:
-            pass
+            return None
         finally:
             conn.close()
 
@@ -269,28 +280,52 @@ class NotificationTracker:
         foreground_hwnd: int,
     ) -> dict[str, AgentNotificationSummary]:
         """Refresh and aggregate notifications for all agents and their open windows."""
-        # Prune closed HWNDs & auto-clear currently focused window
-        all_live_hwnds: set[int] = set()
+        # Title counters and badges are snapshots. Changes seen in the same poll share an order.
+        snapshot_order = next(self._event_orders)
+        live_hwnds: set[int] = set()
+        foreground_agents: set[str] = set()
         for aid, wins in agent_windows.items():
             for w in wins:
                 h = w["hwnd"]
-                all_live_hwnds.add(h)
-                if h == foreground_hwnd:
-                    self.clear_window(h, agent_id=aid if len(wins) == 1 else None)
+                live_hwnds.add(h)
+                title_count = parse_title_unread_count(w.get("title", ""))
+                old_count, old_order = self._title_alerts.get(h, (0, 0))
+                if title_count:
+                    order = snapshot_order if title_count > old_count else old_order
+                    self._title_alerts[h] = title_count, order
+                else:
+                    self._title_alerts.pop(h, None)
+                dismissed_title = self._dismissed_title_counts.get(h)
+                if dismissed_title is not None:
+                    if title_count == 0 or title_count > dismissed_title:
+                        self._dismissed_title_counts.pop(h, None)
+                    elif title_count < dismissed_title:
+                        self._dismissed_title_counts[h] = title_count
 
-        self._flashing_hwnds.intersection_update(all_live_hwnds)
-        for h in list(self._window_toast_counts.keys()):
-            if h not in all_live_hwnds:
-                self._window_toast_counts.pop(h, None)
-                self._window_toast_texts.pop(h, None)
+                if h == foreground_hwnd:
+                    self.clear_window(h)
+                    foreground_agents.add(aid)
+
+        for states in (self._flashing_hwnds, self._window_toasts, self._title_alerts, self._dismissed_title_counts):
+            for h in states.keys() - live_hwnds:
+                del states[h]
 
         active_badges = self._poll_wpn_db(agents, agent_windows, foreground_hwnd)
-        self._last_active_badges = dict(active_badges)
-        # Clear dismissed marker when badge count drops to 0 or changes
-        for aid, dismissed_val in list(self._dismissed_badge_counts.items()):
-            cur_val = active_badges.get(aid, 0)
-            if cur_val == 0 or cur_val != dismissed_val:
-                self._dismissed_badge_counts.pop(aid, None)
+        if active_badges is not None:
+            for aid in self._badge_alerts.keys() - active_badges.keys():
+                del self._badge_alerts[aid]
+            for aid, badge_count in active_badges.items():
+                old_count, old_order = self._badge_alerts.get(aid, (0, 0))
+                order = snapshot_order if badge_count > old_count else old_order
+                self._badge_alerts[aid] = badge_count, order
+            for aid, dismissed_count in list(self._dismissed_badge_counts.items()):
+                cur_badge = active_badges.get(aid, 0)
+                if cur_badge == 0 or cur_badge > dismissed_count:
+                    del self._dismissed_badge_counts[aid]
+                elif cur_badge < dismissed_count:
+                    self._dismissed_badge_counts[aid] = cur_badge
+        for aid in foreground_agents:
+            self.clear_agent_unattributed(aid)
 
         summaries: dict[str, AgentNotificationSummary] = {}
         for agent in agents:
@@ -302,45 +337,49 @@ class NotificationTracker:
 
             win_total = 0
             any_flash = False
-            latest_text = self._agent_toast_texts.get(aid, "")
+            agent_toast = self._agent_toasts.get(aid, _NO_TOAST)
+            latest_toast = agent_toast
+            event_order = agent_toast.order
 
             for w in wins:
                 h = w["hwnd"]
-                title_cnt = parse_title_unread_count(w.get("title", ""))
-                toast_cnt = self._window_toast_counts.get(h, 0)
-                flashing = h in self._flashing_hwnds
-                w_cnt = max(title_cnt, toast_cnt)
-                w_text = self._window_toast_texts.get(h, "")
+                title_count, title_order = self._title_alerts.get(h, (0, 0))
+                if self._dismissed_title_counts.get(h) == title_count:
+                    title_count = title_order = 0
+                toast = self._window_toasts.get(h, _NO_TOAST)
+                flash_order = self._flashing_hwnds.get(h, 0)
+                w_cnt = max(title_count, toast.count)
 
-                if w_cnt > 0 or flashing:
+                if w_cnt > 0 or flash_order:
                     summary.by_hwnd[h] = WindowNotificationState(
                         count=w_cnt,
-                        flashing=flashing,
-                        latest_text=w_text,
+                        flashing=bool(flash_order),
+                        latest_text=toast.text,
                     )
                     win_total += w_cnt
-                    if flashing:
-                        any_flash = True
-                    if w_text and not latest_text:
-                        latest_text = w_text
+                    any_flash |= bool(flash_order)
+                    event_order = max(event_order, title_order, toast.order, flash_order)
+                    if toast.order > latest_toast.order:
+                        latest_toast = toast
 
-            agent_unassigned = self._agent_toast_counts.get(aid, 0)
-            raw_badge = active_badges.get(aid, 0)
-            badge_cnt = 0 if raw_badge and self._dismissed_badge_counts.get(aid) == raw_badge else raw_badge
-            total = max(win_total + agent_unassigned, badge_cnt)
+            badge_count, badge_order = self._badge_alerts.get(aid, (0, 0))
+            if self._dismissed_badge_counts.get(aid) == badge_count:
+                badge_count = badge_order = 0
+            total = max(win_total + agent_toast.count, badge_count)
 
             # If an agent has a single open window and an agent-level alert/badge, mirror it onto that window too
-            if len(wins) == 1 and (agent_unassigned > 0 or badge_cnt > 0):
+            if len(wins) == 1 and (agent_toast.count > 0 or badge_count > 0):
                 sole_h = wins[0]["hwnd"]
                 cur_state = summary.by_hwnd.get(sole_h, WindowNotificationState())
                 cur_state.count = max(cur_state.count, total)
-                if latest_text and not cur_state.latest_text:
-                    cur_state.latest_text = latest_text
+                if latest_toast.text and not cur_state.latest_text:
+                    cur_state.latest_text = latest_toast.text
                 summary.by_hwnd[sole_h] = cur_state
 
             summary.total_count = total
             summary.has_alert = total > 0 or any_flash
-            summary.latest_text = latest_text
+            summary.latest_text = latest_toast.text
+            summary.latest_event_order = max(event_order, badge_order)
             summaries[aid] = summary
 
         return summaries

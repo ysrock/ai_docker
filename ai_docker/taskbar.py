@@ -3,8 +3,18 @@ from __future__ import annotations
 from typing import Any
 
 import pythoncom
+import win32con
 import win32gui
 from win32com.shell import shell
+
+
+def _has_taskbar_style(hwnd: int) -> bool:
+    style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+    if style & win32con.WS_EX_TOOLWINDOW:
+        return False
+    if style & win32con.WS_EX_APPWINDOW:
+        return True
+    return not (style & win32con.WS_EX_NOACTIVATE or win32gui.GetWindow(hwnd, win32con.GW_OWNER))
 
 
 class TaskbarHider:
@@ -69,6 +79,9 @@ class TaskbarHider:
         if not self._ensure_init() or not win32gui.IsWindow(hwnd):
             return False
         try:
+            if not _has_taskbar_style(hwnd):
+                self._hidden_hwnds.discard(hwnd)
+                return False
             self._tb.DeleteTab(hwnd)
             self._hidden_hwnds.add(hwnd)
             return True
@@ -77,11 +90,19 @@ class TaskbarHider:
             return False
 
     def show_window(self, hwnd: int) -> bool:
-        self._hidden_hwnds.discard(hwnd)
-        if not self._ensure_init() or not win32gui.IsWindow(hwnd):
+        if hwnd not in self._hidden_hwnds:
+            return False
+        if not win32gui.IsWindow(hwnd):
+            self._hidden_hwnds.discard(hwnd)
+            return False
+        if not self._ensure_init():
             return False
         try:
+            if not _has_taskbar_style(hwnd):
+                self._hidden_hwnds.discard(hwnd)
+                return False
             self._tb.AddTab(hwnd)
+            self._hidden_hwnds.discard(hwnd)
             return True
         except Exception as exc:
             self._last_error = f"AddTab({hwnd}) failed: {exc}"
@@ -111,7 +132,6 @@ class TaskbarHider:
         for hwnd in list(self._hidden_hwnds):
             if self.show_window(hwnd):
                 restored += 1
-        self._hidden_hwnds.clear()
         return restored
 
     def close(self) -> None:

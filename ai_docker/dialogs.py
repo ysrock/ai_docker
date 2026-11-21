@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from .discovery import build_agent_from_file, discover_new_agents, slugify_id
-from .icons import load_agent_icon
+from .icons import WebIconLoader, load_agent_icon
 
 
 def dialog_stylesheet(theme: str = "dark") -> str:
@@ -338,6 +338,9 @@ class DiscoverAgentsDialog(QDialog):
         super().__init__(parent)
         self.selected_agents: list[dict[str, Any]] = []
         self._candidates = discover_new_agents(existing_agents)
+        self._theme = theme
+        self._web_icons = WebIconLoader(self)
+        self._web_icons.ready.connect(self._on_web_icon_ready)
 
         self.setWindowTitle("扫描本机新安装的 Agent")
         self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
@@ -373,7 +376,7 @@ class DiscoverAgentsDialog(QDialog):
             item = QListWidgetItem(f"{cand['name']}  [{tlabel}]\n{detail}")
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Checked)
-            item.setIcon(load_agent_icon(cand, force_refresh=False, theme=theme))
+            item.setIcon(load_agent_icon(cand, theme=theme, resolve_web_icon=self._web_icons.resolve))
             item.setData(Qt.UserRole, cand)
             self._list.addItem(item)
         root.addWidget(self._list, 1)
@@ -390,6 +393,17 @@ class DiscoverAgentsDialog(QDialog):
             add_btn.clicked.connect(self._on_confirm)
             btn_row.addWidget(add_btn)
         root.addLayout(btn_row)
+
+    def _on_web_icon_ready(self, url: str) -> None:
+        for index in range(self._list.count()):
+            item = self._list.item(index)
+            agent = item.data(Qt.UserRole)
+            if url in (agent.get("icon_source"), agent.get("url")):
+                item.setIcon(load_agent_icon(agent, theme=self._theme, resolve_web_icon=self._web_icons.resolve))
+
+    def done(self, result: int) -> None:
+        self._web_icons.invalidate()
+        super().done(result)
 
     def _on_confirm(self) -> None:
         chosen: list[dict[str, Any]] = []

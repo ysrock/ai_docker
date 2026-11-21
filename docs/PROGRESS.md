@@ -61,6 +61,18 @@
   - 在 `ai_docker/config.py` 新增 `auto_collapse`（默认 `true`）与 `auto_collapse_seconds`（默认 `8`）。
   - 在全局右键菜单新增“立即收缩为悬浮图标 / 立即展开悬浮窗”、“空闲自动收缩为悬浮图标”开关及“自动收缩等待时间（5 / 8 / 15 / 30 秒）”子菜单，取消勾选即刻展开并保持常驻展开。
 
+### 里程碑 9：异步图标加载、事件定序与全量审查修复
+- **异步网页图标与回归测试体系**：
+  - `ai_docker/icons.py` 引入 `WebIconLoader` 将网页图标拉取移至后台 `QThreadPool` 线程并原子替换缓存文件，彻底消除主线程网络卡顿；`_WebIconRequest.run()` 改为全异常兜底防止 `_in_flight` 死锁。
+  - `ai_docker/notifications.py` 引入全局单调事件序号 `latest_event_order` 与精确窗口归属排序，并修复两处通知边界问题：标题未读数或系统 Badge 减少时同步下调忽略水位不再误触发红点；多窗口 Agent 切焦或点击时自动清除未归属的 Agent 级 Toast / Badge 且保留其它窗口的定向通知。
+  - 新增 `tests/test_regressions.py`（9 项 `unittest` 回归用例）。
+- **任务栏样式过滤、路径匹配与配置校验加固**：
+  - `ai_docker/taskbar.py` 增加 `_has_taskbar_style()` 仅对有效任务栏窗口执行 `DeleteTab` / `AddTab` 并保留失败句柄待重试。
+  - `ai_docker/launcher.py` 支持按进程真实路径区分同名多安装实例，使用 `os.path.realpath()` 兼容符号链接/联接/短路径及 Squirrel 版本化子目录结构（`app-*`）；`ai_docker/discovery.py` 增加 VS Code 关键字识别。
+  - `ai_docker/config.py` 收紧并补全 `ui` 与 `agents` 字段校验（排除 `bool` 绕过、收紧像素上限、补全 `args`/`command`/`cwd` 等校验）。
+- **交互边界与内存释放修复**：
+  - `ai_docker/dock_window.py` 修复手动点击“立即收缩为悬浮图标”后因菜单关闭立即 `enterEvent` 弹回的问题（450ms 冷却，移出即复位）；修复靠右锚点启动或增删图标时展开态出屏问题；为扫描/添加弹窗补充 `deleteLater()` 与 `DiscoverAgentsDialog` 关闭时 `invalidate()`；统一封装 `_persist_config()` 容错处理文件占用异常。
+
 ## 后续规划
 - 支持自定义全局快捷键呼出/切换悬浮窗。
 - 探索支持按需折叠单个 Agent 的项目卡片。

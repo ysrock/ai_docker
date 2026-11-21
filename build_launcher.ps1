@@ -11,6 +11,9 @@ $Icon = Join-Path $Root "assets\ai_docker.ico"
 $Src = Join-Path $Root "launcher_src\AiDockerLauncher.cs"
 
 & $Csc /nologo /target:winexe /optimize+ "/win32icon:$Icon" /reference:System.Windows.Forms.dll "/out:$OutExe" $Src
+if ($LASTEXITCODE -ne 0) {
+    throw "C# compilation failed (exit code $LASTEXITCODE)."
+}
 Write-Output "Built: $OutExe"
 
 $StartMenuLnk = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\AI docker.lnk"

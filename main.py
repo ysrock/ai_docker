@@ -6,9 +6,9 @@ from ctypes import wintypes
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
-from ai_docker.config import PROJECT_ROOT
+from ai_docker.config import ConfigLoadError, PROJECT_ROOT
 from ai_docker.dock_window import AgentDockWindow
 
 ERROR_ALREADY_EXISTS = 183
@@ -49,7 +49,11 @@ def main() -> int:
             app.setWindowIcon(QIcon(str(ico_path)))
         app.setQuitOnLastWindowClosed(True)
 
-        dock = AgentDockWindow()
+        try:
+            dock = AgentDockWindow()
+        except ConfigLoadError as exc:
+            QMessageBox.critical(None, "AI docker 配置加载失败", f"无法读取 agents.json：\n{exc}")
+            return 1
         dock.show()
         return app.exec()
     finally:

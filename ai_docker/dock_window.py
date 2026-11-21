@@ -4,6 +4,7 @@ import atexit
 import ctypes
 import math
 import os
+import time
 from ctypes import wintypes
 from typing import Any
 
@@ -40,7 +41,7 @@ from PySide6.QtWidgets import (
 from .config import CONFIG_PATH, PROJECT_ROOT, ConfigLoadError, load_config, save_config
 from .dialogs import AddAgentDialog, DiscoverAgentsDialog
 from .discovery import build_agent_from_file
-from .icons import load_agent_icon
+from .icons import WebIconLoader, load_agent_icon
 from .launcher import (
     focus_hwnd,
     get_agent_window_map,
@@ -183,6 +184,10 @@ class AgentIconButton(QWidget):
 
     def set_target_scale(self, scale: float) -> None:
         self._target_scale = scale
+
+    def set_icon(self, icon: QIcon) -> None:
+        self._icon = icon
+        self.update()
 
     def step_animation(self) -> bool:
         """Advance magnification lerp by one frame; returns True if still animating."""
@@ -1088,6 +1093,8 @@ class AgentDockWindow(QWidget):
         self._drag_offset: QPoint | None = None
         self._buttons: dict[str, AgentIconButton] = {}
         self._icons: dict[str, QIcon] = {}
+        self._web_icons = WebIconLoader(self)
+        self._web_icons.ready.connect(self._on_web_icon_ready)
         self._agent_windows: dict[str, list[dict[str, Any]]] = {}
         self._last_notif_map: dict[str, AgentNotificationSummary] = {}
         self._last_shelf_sig: tuple[Any, ...] | None = None
@@ -1099,10 +1106,9 @@ class AgentDockWindow(QWidget):
 
         self._collapsed: bool = False
         self._collapsed_anchor: QPoint | None = None
+        self._expand_cooldown_until: float = 0.0
         self._menu_open: bool = False
         self._dialog_open: bool = False
-        self._prev_alert_meta: dict[str, tuple[int, str]] = {}
-        self._alert_order: list[str] = []
         self._default_app_icon: QIcon = self._load_default_app_icon()
 
         app = QApplication.instance()
@@ -1129,7 +1135,7 @@ class AgentDockWindow(QWidget):
             alpha=self._capsule_alpha(),
             parent=self,
         )
-        self._orb.hovered.connect(self._expand_dock)
+        self._orb.hovered.connect(self._on_orb_hovered)
         self._orb.hide()
         self._root_layout.addWidget(self._orb, 0, Qt.AlignLeft)
 
@@ -1155,6 +1161,7 @@ class AgentDockWindow(QWidget):
         self._rebuild_dock(force_refresh_icons=False)
         self._restore_position()
         self._collapsed_anchor = self.pos()
+        self.move(self._clamp_expanded_position(self._collapsed_anchor))
 
         self._collapse_timer = QTimer(self)
         self._collapse_timer.setSingleShot(True)
@@ -1184,7 +1191,7 @@ class AgentDockWindow(QWidget):
     def _auto_collapse_seconds(self) -> int:
         try:
             sec = int(self.config["ui"].get("auto_collapse_seconds", 8))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             sec = 8
         return max(2, min(300, sec))
 
@@ -1218,6 +1225,11 @@ class AgentDockWindow(QWidget):
         self._cancel_auto_collapse()
         if self._collapsed_anchor is None:
             self._collapsed_anchor = self.pos()
+        if force:
+            # Prevent menu-close enterEvent from immediately bouncing a manual collapse open
+            self._expand_cooldown_until = time.monotonic() + 0.45
+        else:
+            self._expand_cooldown_until = 0.0
         self._top_bar.hide()
         self._shelf.hide()
         self._orb.show()
@@ -1226,8 +1238,13 @@ class AgentDockWindow(QWidget):
         self.move(self._collapsed_anchor)
         self.update()
 
+    def _on_orb_hovered(self) -> None:
+        if self._collapsed and time.monotonic() >= self._expand_cooldown_until:
+            self._expand_dock()
+
     def _expand_dock(self) -> None:
         self._cancel_auto_collapse()
+        self._expand_cooldown_until = 0.0
         if not self._collapsed:
             return
         self._collapsed_anchor = self.pos()
@@ -1241,27 +1258,47 @@ class AgentDockWindow(QWidget):
         self._collapsed = False
         self.adjustSize()
 
-        # Clamp expanded dock inside current screen so right/bottom-edge orbs expand cleanly
-        anchor = self._collapsed_anchor
-        target_x = anchor.x()
-        target_y = anchor.y()
-        screen = QGuiApplication.screenAt(anchor + QPoint(24, 24)) or QGuiApplication.primaryScreen()
-        if screen is not None:
-            geo = screen.availableGeometry()
-            max_x = geo.right() - self.width() + 1
-            max_y = geo.bottom() - self.height() + 1
-            target_x = max(geo.left(), min(target_x, max_x))
-            target_y = max(geo.top(), min(target_y, max_y))
-        self.move(target_x, target_y)
+        self.move(self._clamp_expanded_position(self._collapsed_anchor))
         self.update()
+
+    def _reposition_after_rebuild(self, top_left: QPoint) -> None:
+        if self._collapsed:
+            self.move(top_left)
+        else:
+            self.move(self._clamp_expanded_position(top_left))
+
+    def _persist_config(self) -> bool:
+        try:
+            save_config(self.config)
+            return True
+        except OSError as exc:
+            QMessageBox.warning(
+                self,
+                "AI docker 配置保存失败",
+                f"无法写入 agents.json（可能正被其他程序占用）：\n{exc}",
+            )
+            return False
+
+    def _clamp_expanded_position(self, position: QPoint) -> QPoint:
+        screen = QGuiApplication.screenAt(position + QPoint(24, 24)) or QGuiApplication.primaryScreen()
+        if screen is None:
+            return position
+        geo = screen.availableGeometry()
+        max_x = geo.right() - self.width() + 1
+        max_y = geo.bottom() - self.height() + 1
+        return QPoint(
+            max(geo.left(), min(position.x(), max_x)),
+            max(geo.top(), min(position.y(), max_y)),
+        )
 
     def enterEvent(self, event) -> None:
         self._cancel_auto_collapse()
-        if self._collapsed:
+        if self._collapsed and time.monotonic() >= self._expand_cooldown_until:
             self._expand_dock()
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
+        self._expand_cooldown_until = 0.0
         self._schedule_auto_collapse()
         super().leaveEvent(event)
 
@@ -1361,12 +1398,12 @@ class AgentDockWindow(QWidget):
             added += 1
 
         if added > 0:
-            save_config(self.config)
+            self._persist_config()
             if self._collapsed:
                 self._expand_dock()
             top_left = self.pos()
             self._rebuild_dock(force_refresh_icons=False)
-            self.move(top_left)
+            self._reposition_after_rebuild(top_left)
             self._refresh_state()
             self._schedule_auto_collapse()
             event.acceptProposedAction()
@@ -1424,6 +1461,8 @@ class AgentDockWindow(QWidget):
         theme = self._theme()
         btn_size = int(ui.get("button_size", 46))
         icon_size = int(ui.get("icon_size", 32))
+        if force_refresh_icons:
+            self._web_icons.invalidate()
 
         while self._top_bar.row_layout.count():
             item = self._top_bar.row_layout.takeAt(0)
@@ -1442,7 +1481,9 @@ class AgentDockWindow(QWidget):
             if agent.get("enabled", True) is False:
                 continue
             aid = agent.get("id", "")
-            icon = load_agent_icon(agent, force_refresh=force_refresh_icons, theme=theme)
+            icon = load_agent_icon(
+                agent, force_refresh=force_refresh_icons, theme=theme, resolve_web_icon=self._web_icons.resolve
+            )
             self._icons[aid] = icon
             btn = AgentIconButton(
                 agent=agent,
@@ -1464,6 +1505,16 @@ class AgentDockWindow(QWidget):
         self._top_bar.adjustSize()
         self.adjustSize()
         self.update()
+
+    def _on_web_icon_ready(self, url: str) -> None:
+        for aid, btn in self._buttons.items():
+            if url not in (btn.agent.get("icon_source"), btn.agent.get("url")):
+                continue
+            icon = load_agent_icon(btn.agent, theme=self._theme(), resolve_web_icon=self._web_icons.resolve)
+            self._icons[aid] = icon
+            btn.set_icon(icon)
+        self._last_shelf_sig = None
+        self._update_orb_state(self.config["agents"], self._last_notif_map)
 
     def _rebuild_shelf(
         self,
@@ -1517,7 +1568,7 @@ class AgentDockWindow(QWidget):
             for ag in active_agents:
                 aid = ag.get("id", "")
                 wins = agent_windows.get(aid, [])
-                icon = self._icons.get(aid) or load_agent_icon(ag, force_refresh=False, theme=theme)
+                icon = self._icons.get(aid) or self._default_app_icon
                 summary = notif_map.get(aid, AgentNotificationSummary())
                 card = AgentWorkspaceCard(
                     agent=ag,
@@ -1562,7 +1613,7 @@ class AgentDockWindow(QWidget):
     def _save_position(self) -> None:
         pos = self.pos()
         self.config["ui"]["pos"] = [pos.x(), pos.y()]
-        save_config(self.config)
+        self._persist_config()
 
     def _update_orb_state(
         self,
@@ -1576,51 +1627,29 @@ class AgentDockWindow(QWidget):
             if a.get("enabled", True) is not False and a.get("id")
         }
 
-        alerting_ids: set[str] = set()
-        new_meta: dict[str, tuple[int, str]] = {}
-        total_notif_count = 0
-
-        for aid in enabled_by_id:
-            summary = notif_map.get(aid)
-            if summary is not None and summary.has_alert:
-                alerting_ids.add(aid)
-                total_notif_count += summary.total_count
-                cur_meta = (summary.total_count, summary.latest_text)
-                new_meta[aid] = cur_meta
-                prev = self._prev_alert_meta.get(aid)
-                is_new_event = (
-                    prev is None
-                    or cur_meta[0] > prev[0]
-                    or (cur_meta[1] and cur_meta[1] != prev[1])
-                )
-                if is_new_event:
-                    if aid in self._alert_order:
-                        self._alert_order.remove(aid)
-                    self._alert_order.append(aid)
-
-        self._alert_order = [aid for aid in self._alert_order if aid in alerting_ids]
-        for aid in alerting_ids:
-            if aid not in self._alert_order:
-                self._alert_order.append(aid)
-        self._prev_alert_meta = new_meta
+        alerting = {
+            aid: notif_map[aid]
+            for aid in enabled_by_id
+            if aid in notif_map and notif_map[aid].has_alert
+        }
 
         running_count = sum(
             len(self._agent_windows.get(aid, [])) for aid in enabled_by_id
         )
 
-        if self._alert_order:
-            latest_aid = self._alert_order[-1]
-            latest_agent = enabled_by_id.get(latest_aid, {})
-            latest_summary = notif_map.get(latest_aid, AgentNotificationSummary())
+        if alerting:
+            latest_aid = max(alerting, key=lambda aid: alerting[aid].latest_event_order)
+            latest_agent = enabled_by_id[latest_aid]
+            latest_summary = alerting[latest_aid]
             icon = self._icons.get(latest_aid) or self._default_app_icon
             self._orb.update_state(
                 icon=icon,
                 running_count=running_count,
-                notif_count=total_notif_count,
+                notif_count=sum(summary.total_count for summary in alerting.values()),
                 has_alert=True,
                 alert_agent_id=latest_aid,
                 alert_agent_name=latest_agent.get("name", latest_aid),
-                alert_agent_count=len(self._alert_order),
+                alert_agent_count=len(alerting),
                 alert_text=latest_summary.latest_text,
             )
         else:
@@ -1668,6 +1697,8 @@ class AgentDockWindow(QWidget):
         if shelf_changed and not self._collapsed:
             top_left = self.pos()
             self.adjustSize()
+            if self._drag_offset is None:
+                top_left = self._clamp_expanded_position(top_left)
             self.move(top_left)
             self.update()
 
@@ -1691,6 +1722,8 @@ class AgentDockWindow(QWidget):
         wins = self._agent_windows.get(aid, [])
         if len(wins) <= 1:
             self._notif_tracker.clear_agent(aid, [w["hwnd"] for w in wins])
+        else:
+            self._notif_tracker.clear_agent_unattributed(aid)
 
         focus_existing = bool(self.config["ui"].get("focus_existing", True))
         ok, msg = launch_agent(agent, focus_existing=focus_existing)
@@ -1707,8 +1740,8 @@ class AgentDockWindow(QWidget):
             QTimer.singleShot(500, self._refresh_state)
 
     def _on_window_chip_clicked(self, hwnd: int, agent_id: str) -> None:
-        wins = self._agent_windows.get(agent_id, [])
-        self._notif_tracker.clear_window(hwnd, agent_id=agent_id if len(wins) <= 1 else None)
+        self._notif_tracker.clear_window(hwnd)
+        self._notif_tracker.clear_agent_unattributed(agent_id)
         focus_hwnd(hwnd)
         QTimer.singleShot(180, self._refresh_state)
 
@@ -1965,37 +1998,44 @@ class AgentDockWindow(QWidget):
             menu.exec(global_pos)
         finally:
             self._menu_open = False
+            menu.deleteLater()
             self._schedule_auto_collapse()
 
     def _open_discover_dialog(self) -> None:
         self._dialog_open = True
         self._cancel_auto_collapse()
+        dlg: DiscoverAgentsDialog | None = None
         try:
             dlg = DiscoverAgentsDialog(self.config.get("agents", []), theme=self._theme(), parent=self)
             if dlg.exec() and dlg.selected_agents:
                 self.config["agents"].extend(dlg.selected_agents)
-                save_config(self.config)
+                self._persist_config()
                 top_left = self.pos()
                 self._rebuild_dock(force_refresh_icons=False)
-                self.move(top_left)
+                self._reposition_after_rebuild(top_left)
                 self._refresh_state()
         finally:
+            if dlg is not None:
+                dlg.deleteLater()
             self._dialog_open = False
             self._schedule_auto_collapse()
 
     def _open_add_dialog(self) -> None:
         self._dialog_open = True
         self._cancel_auto_collapse()
+        dlg: AddAgentDialog | None = None
         try:
             dlg = AddAgentDialog(self.config.get("agents", []), theme=self._theme(), parent=self)
             if dlg.exec() and dlg.created_agent:
                 self.config["agents"].append(dlg.created_agent)
-                save_config(self.config)
+                self._persist_config()
                 top_left = self.pos()
                 self._rebuild_dock(force_refresh_icons=False)
-                self.move(top_left)
+                self._reposition_after_rebuild(top_left)
                 self._refresh_state()
         finally:
+            if dlg is not None:
+                dlg.deleteLater()
             self._dialog_open = False
             self._schedule_auto_collapse()
 
@@ -2007,7 +2047,7 @@ class AgentDockWindow(QWidget):
 
     def _toggle_auto_collapse(self, checked: bool) -> None:
         self.config["ui"]["auto_collapse"] = bool(checked)
-        save_config(self.config)
+        self._persist_config()
         if not checked:
             self._cancel_auto_collapse()
             self._expand_dock()
@@ -2017,16 +2057,16 @@ class AgentDockWindow(QWidget):
     def _set_auto_collapse_seconds(self, seconds: int) -> None:
         self.config["ui"]["auto_collapse_seconds"] = max(2, int(seconds))
         self.config["ui"]["auto_collapse"] = True
-        save_config(self.config)
+        self._persist_config()
         self._schedule_auto_collapse()
 
     def _toggle_theme(self) -> None:
         self.config["ui"]["theme"] = "light" if self._theme() == "dark" else "dark"
-        save_config(self.config)
+        self._persist_config()
         top_left = self.pos()
         self._apply_styles()
         self._rebuild_dock(force_refresh_icons=False)
-        self.move(top_left)
+        self._reposition_after_rebuild(top_left)
         self._refresh_state()
 
     def _move_agent_to_visible_index(self, agent_id: str, new_visible_idx: int) -> None:
@@ -2048,10 +2088,10 @@ class AgentDockWindow(QWidget):
         for slot_idx, item in zip(visible_slots, visible_items):
             agents[slot_idx] = item
 
-        save_config(self.config)
+        self._persist_config()
         top_left = self.pos()
         self._rebuild_dock(force_refresh_icons=False)
-        self.move(top_left)
+        self._reposition_after_rebuild(top_left)
         self._refresh_state()
 
     def _shift_agent(self, agent_id: str, delta: int) -> None:
@@ -2077,10 +2117,10 @@ class AgentDockWindow(QWidget):
                 break
         if not changed:
             return
-        save_config(self.config)
+        self._persist_config()
         top_left = self.pos()
         self._rebuild_dock(force_refresh_icons=False)
-        self.move(top_left)
+        self._reposition_after_rebuild(top_left)
         self._refresh_state()
 
     def _show_all_agents(self) -> None:
@@ -2091,20 +2131,20 @@ class AgentDockWindow(QWidget):
                 changed = True
         if not changed:
             return
-        save_config(self.config)
+        self._persist_config()
         top_left = self.pos()
         self._rebuild_dock(force_refresh_icons=False)
-        self.move(top_left)
+        self._reposition_after_rebuild(top_left)
         self._refresh_state()
 
     def _toggle_show_window_list(self, checked: bool) -> None:
         self.config["ui"]["show_window_list"] = bool(checked)
-        save_config(self.config)
+        self._persist_config()
         self._refresh_state()
 
     def _toggle_hide_from_taskbar(self, checked: bool) -> None:
         self.config["ui"]["hide_from_taskbar"] = bool(checked)
-        save_config(self.config)
+        self._persist_config()
         if not checked:
             self._taskbar_hider.restore_all()
         self._refresh_state()
@@ -2124,11 +2164,8 @@ class AgentDockWindow(QWidget):
             return
 
         target["hide_from_taskbar"] = new_hide
-        save_config(self.config)
+        self._persist_config()
 
-        if released:
-            for w in self._agent_windows.get(agent_id, []):
-                self._taskbar_hider.show_window(w["hwnd"])
         self._refresh_state()
 
     def _reclaim_all_released(self) -> None:
@@ -2139,12 +2176,12 @@ class AgentDockWindow(QWidget):
                 changed = True
         if not changed:
             return
-        save_config(self.config)
+        self._persist_config()
         self._refresh_state()
 
     def _toggle_focus_existing(self, checked: bool) -> None:
         self.config["ui"]["focus_existing"] = bool(checked)
-        save_config(self.config)
+        self._persist_config()
 
     def _clear_all_notifications(self) -> None:
         for agent in self.config.get("agents", []):
@@ -2155,7 +2192,7 @@ class AgentDockWindow(QWidget):
 
     def _reload_all(self) -> None:
         try:
-            new_cfg = load_config(strict=True)
+            new_cfg = load_config()
         except ConfigLoadError as exc:
             QMessageBox.warning(
                 self,
@@ -2167,7 +2204,7 @@ class AgentDockWindow(QWidget):
         top_left = self.pos()
         self._apply_styles()
         self._rebuild_dock(force_refresh_icons=True)
-        self.move(top_left)
+        self._reposition_after_rebuild(top_left)
         self._refresh_state()
         if not self._auto_collapse_enabled():
             self._cancel_auto_collapse()
@@ -2183,6 +2220,7 @@ class AgentDockWindow(QWidget):
 
     def _cleanup_resources(self) -> None:
         atexit.unregister(self._cleanup_resources)
+        self._web_icons.invalidate()
         if hasattr(self, "_collapse_timer"):
             self._collapse_timer.stop()
         if hasattr(self, "_status_timer"):

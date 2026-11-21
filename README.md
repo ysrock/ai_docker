@@ -27,7 +27,7 @@
 ## 环境要求
 
 - Windows 10 (1809+) 或 Windows 11（64 位）
-- Python 3.12+（推荐使用 [uv](https://docs.astral.sh/uv/) 管理虚拟环境）
+- Python 3.13+（推荐使用 [uv](https://docs.astral.sh/uv/) 管理虚拟环境）
 - 可选：Windows Terminal（用于更优雅地拉起 CLI 类 Agent）与 Chrome/Edge（用于网页应用独立窗口模式）
 
 ## 快速开始
@@ -122,6 +122,7 @@ ai_docker/
 支持 4 种 `type`：
 
 - `exe`：Win32 桌面程序，常用字段 `path`、`args`、`cwd`、`match_process`。
+  当 `path` 是绝对路径且文件名与 `match_process` 一致时，按完整进程路径区分不同安装。可将 `match_path` 设为 `false`，允许同名的不同安装共用该条目。
 - `msix`：Windows Store / MSIX 应用，常用字段 `aumid`（`PackageFamilyName!AppId`）、`match_process`。
 - `cli`：终端命令行 Agent，常用字段 `command`、`terminal_title`、`cwd`、`cli_badge`、`icon_source`、`match_process`、`match_title`。
 - `web`：网页版 Agent，常用字段 `url`、`app_mode`（`true` 使用浏览器独立应用窗口）、`browser`、`match_process`、`match_title`。
