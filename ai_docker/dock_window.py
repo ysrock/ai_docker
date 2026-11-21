@@ -932,7 +932,7 @@ class AgentDockWindow(QWidget):
             app.aboutToQuit.connect(self._cleanup_resources)
         atexit.register(self._cleanup_resources)
 
-        self.setWindowTitle("AI Doker")
+        self.setWindowTitle("AI docker")
         self.setWindowFlags(
             Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool
         )
@@ -1315,7 +1315,7 @@ class AgentDockWindow(QWidget):
         focus_existing = bool(self.config["ui"].get("focus_existing", True))
         ok, msg = launch_agent(agent, focus_existing=focus_existing)
         if not ok:
-            QMessageBox.warning(self, "AI Doker 启动失败", f"{agent.get('name', '')}: {msg}")
+            QMessageBox.warning(self, "AI docker 启动失败", f"{agent.get('name', '')}: {msg}")
         else:
             QTimer.singleShot(350, self._refresh_state)
 
@@ -1452,7 +1452,7 @@ class AgentDockWindow(QWidget):
         autostart_action.setChecked(is_autostart_enabled())
         autostart_action.triggered.connect(self._toggle_autostart)
 
-        quit_action = menu.addAction("退出 AI Doker (还原任务栏图标)")
+        quit_action = menu.addAction("退出 AI docker (还原任务栏图标)")
         quit_action.triggered.connect(self._quit_app)
 
         menu.exec(global_pos)

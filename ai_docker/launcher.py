@@ -403,7 +403,7 @@ def get_startup_shortcut_path() -> Path:
         / "Programs"
         / "Startup"
     )
-    return startup_dir / "AI Doker.lnk"
+    return startup_dir / "AI docker.lnk"
 
 
 def is_autostart_enabled() -> bool:
@@ -419,8 +419,8 @@ def set_autostart(enabled: bool) -> bool:
 
     import win32com.client
 
-    exe_launcher = PROJECT_ROOT / "AI Doker.exe"
-    ico_path = PROJECT_ROOT / "assets" / "ai_doker.ico"
+    exe_launcher = PROJECT_ROOT / "AI docker.exe"
+    ico_path = PROJECT_ROOT / "assets" / "ai_docker.ico"
 
     shell = win32com.client.Dispatch("WScript.Shell")
     shortcut = shell.CreateShortcut(str(lnk_path))
@@ -437,6 +437,6 @@ def set_autostart(enabled: bool) -> bool:
         if ico_path.exists():
             shortcut.IconLocation = f"{ico_path},0"
     shortcut.WorkingDirectory = str(PROJECT_ROOT)
-    shortcut.Description = "AI Doker - AI Agent Floating Dock"
+    shortcut.Description = "AI docker - AI Agent Floating Dock"
     shortcut.save()
     return True

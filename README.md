@@ -1,4 +1,4 @@
-# AI Doker
+# AI docker
 
 面向 Windows 10/11 的轻量化 macOS 风格置顶悬浮窗，将本机各类 AI Agent（Win32 桌面端、MSIX 商店应用、终端 CLI、网页应用）集中收纳在一个双层毛玻璃 HUD 中，自动隐藏 Windows 任务栏中的重复运行图标，并按当前工作项目向下展开窗口列表与实时通知角标。
 
@@ -42,7 +42,7 @@ uv sync
 .\build_launcher.ps1
 ```
 
-脚本会调用 Windows 自带的 .NET 编译器生成约 40 KB 的原生无黑框 `AI Doker.exe`（内嵌专属图标），并在开始菜单注册 `AI Doker` 快捷方式。完成后直接双击 `AI Doker.exe` 或按 `Win` 键搜索 `AI Doker` 即可静默启动。
+脚本会调用 Windows 自带的 .NET 编译器生成约 40 KB 的原生无黑框 `AI docker.exe`（内嵌专属图标），并在开始菜单注册 `AI docker` 快捷方式。完成后直接双击 `AI docker.exe` 或按 `Win` 键搜索 `AI docker` 即可静默启动。
 
 ### 3. 直接命令行启动
 
@@ -67,13 +67,13 @@ uv sync
 ai_docker/
 ├── main.py                       # 程序入口（单实例互斥锁 + 高分屏配置）
 ├── start_dock.pyw                # 无控制台 Python 入口
-├── build_launcher.ps1            # 一键编译原生 AI Doker.exe 并创建开始菜单快捷方式
+├── build_launcher.ps1            # 一键编译原生 AI docker.exe 并创建开始菜单快捷方式
 ├── launcher_src/
-│   └── AiDokerLauncher.cs        # WinExe 极简无黑框启动器源码
+│   └── AiDockerLauncher.cs        # WinExe 极简无黑框启动器源码
 ├── assets/
-│   ├── ai_doker.ico              # 多分辨率应用图标
-│   └── ai_doker.png              # 应用图标预览图
-├── ai_doker/
+│   ├── ai_docker.ico              # 多分辨率应用图标
+│   └── ai_docker.png              # 应用图标预览图
+├── ai_docker/
 │   ├── config.py                 # 配置读写与首启自动探测初始化
 │   ├── discovery.py              # 本机 AI Agent 自动扫描与 .lnk/.exe 解析
 │   ├── icons.py                  # 高清真实图标提取、主题反色适配与本地缓存
@@ -133,8 +133,8 @@ ai_docker/
 
 1. **某个 Agent 的窗口没有从任务栏隐藏？**
    检查 `agents.json` 中该条目的 `match_process` 是否与任务管理器中的真实 `.exe` 进程名一致；若该程序以管理员身份运行，需保持普通权限启动或在需要时调整权限。
-2. **退出 AI Doker 后窗口找不到了？**
-   正常通过右键菜单“退出 AI Doker”或关闭窗口退出时会自动调用 `ITaskbarList::AddTab` 还原全部窗口；若遇异常强杀进程，按 `Alt + Tab` 切换或重新启动一次 AI Doker 并取消勾选“自动隐藏任务栏图标”即可全部恢复。
+2. **退出 AI docker 后窗口找不到了？**
+   正常通过右键菜单“退出 AI docker”或关闭窗口退出时会自动调用 `ITaskbarList::AddTab` 还原全部窗口；若遇异常强杀进程，按 `Alt + Tab` 切换或重新启动一次 AI docker 并取消勾选“自动隐藏任务栏图标”即可全部恢复。
 3. **不想隐藏某一个具体软件的任务栏图标？**
    在本地 `agents.json` 对应条目中添加 `"hide_from_taskbar": false`，然后右键点“重新加载配置与图标”。
 

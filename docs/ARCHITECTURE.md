@@ -1,20 +1,20 @@
-# AI Doker 架构与底层实现说明
+# AI docker 架构与底层实现说明
 
-本文档说明 AI Doker 的模块职责与 Windows 桌面集成机制，方便二次开发与维护。
+本文档说明 AI docker 的模块职责与 Windows 桌面集成机制，方便二次开发与维护。
 
 ## 1. 模块职责总览
 
 | 模块 | 职责 |
 | --- | --- |
-| `main.py` | 单实例 Win32 互斥锁（`Local\AI_Doker_FloatingDock_Mutex`）、高分屏缩放策略初始化、应用图标设置 |
-| `ai_doker/config.py` | 读写本地 `agents.json`；当配置文件不存在时自动触发 `discover_new_agents([])` 完成首启初始化 |
-| `ai_doker/discovery.py` | 快速扫描桌面/开始菜单快捷方式、常见程序目录（浅层）、AppModel 注册表 MSIX 家族和 `PATH` 命令行，以及拖入 `.exe`/`.lnk` 解析 |
-| `ai_doker/icons.py` | Win32 `PrivateExtractIconsW` RGBA 提取（带 legacy mask 兜底）、MSIX AppModel 动态目录 Logo 定位与深浅主题反色选择、网页 Favicon 拉取与本地 PNG 缓存、圆角裁剪与 CLI `>_` 角标合成 |
-| `ai_doker/launcher.py` | 顶层可见窗口枚举（过滤 `WS_EX_TOOLWINDOW` 与 DWM Cloaked 窗口）、`QueryFullProcessImageNameW` 进程名解析、项目名提取、多窗口轮切与前台锁兜底唤醒、多类型进程启动与开机自启快捷方式管理 |
-| `ai_doker/taskbar.py` | 通过 `pywin32` 原生 `ITaskbarList` COM 接口管理运行中窗口的任务栏隐藏（`DeleteTab`）与还原（`AddTab`），内置 `Shell_TrayWnd` 句柄变化检测以兼容 `explorer.exe` 重启 |
-| `ai_doker/notifications.py` | 聚合 Windows 本地通知库 `wpndatabase.db` 水位线增量 Toast/Badge、Windows Shell Hook `HSHELL_FLASH` 闪烁事件与窗口标题未读数字，并按项目名归属到具体窗口 |
-| `ai_doker/dialogs.py` | 适配深/浅双主题的本机扫描导入弹窗（`DiscoverAgentsDialog`）与手动添加弹窗（`AddAgentDialog`） |
-| `ai_doker/dock_window.py` | 双层毛玻璃 HUD 主窗口（`TopDockCapsule` + `AgentWorkspaceCard`）、60fps 余弦波浪放大动画、文件拖放接收、右键菜单与全局状态轮询 |
+| `main.py` | 单实例 Win32 互斥锁（`Local\AI_docker_FloatingDock_Mutex`）、高分屏缩放策略初始化、应用图标设置 |
+| `ai_docker/config.py` | 读写本地 `agents.json`；当配置文件不存在时自动触发 `discover_new_agents([])` 完成首启初始化 |
+| `ai_docker/discovery.py` | 快速扫描桌面/开始菜单快捷方式、常见程序目录（浅层）、AppModel 注册表 MSIX 家族和 `PATH` 命令行，以及拖入 `.exe`/`.lnk` 解析 |
+| `ai_docker/icons.py` | Win32 `PrivateExtractIconsW` RGBA 提取（带 legacy mask 兜底）、MSIX AppModel 动态目录 Logo 定位与深浅主题反色选择、网页 Favicon 拉取与本地 PNG 缓存、圆角裁剪与 CLI `>_` 角标合成 |
+| `ai_docker/launcher.py` | 顶层可见窗口枚举（过滤 `WS_EX_TOOLWINDOW` 与 DWM Cloaked 窗口）、`QueryFullProcessImageNameW` 进程名解析、项目名提取、多窗口轮切与前台锁兜底唤醒、多类型进程启动与开机自启快捷方式管理 |
+| `ai_docker/taskbar.py` | 通过 `pywin32` 原生 `ITaskbarList` COM 接口管理运行中窗口的任务栏隐藏（`DeleteTab`）与还原（`AddTab`），内置 `Shell_TrayWnd` 句柄变化检测以兼容 `explorer.exe` 重启 |
+| `ai_docker/notifications.py` | 聚合 Windows 本地通知库 `wpndatabase.db` 水位线增量 Toast/Badge、Windows Shell Hook `HSHELL_FLASH` 闪烁事件与窗口标题未读数字，并按项目名归属到具体窗口 |
+| `ai_docker/dialogs.py` | 适配深/浅双主题的本机扫描导入弹窗（`DiscoverAgentsDialog`）与手动添加弹窗（`AddAgentDialog`） |
+| `ai_docker/dock_window.py` | 双层毛玻璃 HUD 主窗口（`TopDockCapsule` + `AgentWorkspaceCard`）、60fps 余弦波浪放大动画、文件拖放接收、右键菜单与全局状态轮询 |
 
 ## 2. 关键 Windows 底层机制
 

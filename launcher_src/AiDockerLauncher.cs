@@ -3,7 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Windows.Forms;
 
-namespace AiDokerLauncher
+namespace AiDockerLauncher
 {
     internal static class Program
     {
@@ -18,7 +18,7 @@ namespace AiDokerLauncher
             {
                 MessageBox.Show(
                     "找不到虚拟环境解释器：\n" + pythonw,
-                    "AI Doker 启动失败",
+                    "AI docker 启动失败",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error
                 );
@@ -29,7 +29,7 @@ namespace AiDokerLauncher
             {
                 MessageBox.Show(
                     "找不到启动脚本：\n" + script,
-                    "AI Doker 启动失败",
+                    "AI docker 启动失败",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error
                 );
@@ -53,8 +53,8 @@ namespace AiDokerLauncher
             catch (Exception ex)
             {
                 MessageBox.Show(
-                    "启动 AI Doker 时出错：\n" + ex.Message,
-                    "AI Doker 启动失败",
+                    "启动 AI docker 时出错：\n" + ex.Message,
+                    "AI docker 启动失败",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error
                 );
