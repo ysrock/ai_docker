@@ -21,6 +21,8 @@ DEFAULT_UI: dict[str, Any] = {
     "hide_from_taskbar": True,
     "show_window_list": True,
     "window_chip_width": 138,
+    "auto_collapse": True,
+    "auto_collapse_seconds": 8,
 }
 
 

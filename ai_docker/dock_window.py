@@ -37,7 +37,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .config import CONFIG_PATH, ConfigLoadError, load_config, save_config
+from .config import CONFIG_PATH, PROJECT_ROOT, ConfigLoadError, load_config, save_config
 from .dialogs import AddAgentDialog, DiscoverAgentsDialog
 from .discovery import build_agent_from_file
 from .icons import load_agent_icon
@@ -913,6 +913,172 @@ class AgentWorkspaceCard(QWidget):
         painter.end()
 
 
+class CollapsedDockOrb(QWidget):
+    """Compact macOS frosted-glass floating orb when AI docker auto-collapses during idle."""
+
+    hovered = Signal()
+
+    def __init__(
+        self,
+        icon: QIcon,
+        theme: str = "dark",
+        alpha: int = 232,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self._icon = icon
+        self._theme = theme
+        self._alpha = alpha
+        self._shadow_pad = 7
+        self._orb_size = 52
+        self._running_count = 0
+        self._notif_count = 0
+        self._has_alert = False
+        self._alert_agent_id = ""
+        self._alert_agent_name = ""
+        self._alert_agent_count = 0
+        self._alert_text = ""
+        self._drop_highlight = False
+
+        total = self._orb_size + self._shadow_pad * 2
+        self.setFixedSize(total, total)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setCursor(Qt.PointingHandCursor)
+        self._refresh_tooltip()
+
+    def set_theme_and_alpha(self, theme: str, alpha: int) -> None:
+        if self._theme != theme or self._alpha != alpha:
+            self._theme = theme
+            self._alpha = alpha
+            self.update()
+
+    def set_drop_highlight(self, active: bool) -> None:
+        if self._drop_highlight != active:
+            self._drop_highlight = active
+            self.update()
+
+    def update_state(
+        self,
+        icon: QIcon,
+        running_count: int,
+        notif_count: int,
+        has_alert: bool,
+        alert_agent_id: str = "",
+        alert_agent_name: str = "",
+        alert_agent_count: int = 0,
+        alert_text: str = "",
+    ) -> None:
+        self._icon = icon
+        self._running_count = running_count
+        self._notif_count = notif_count
+        self._has_alert = has_alert
+        self._alert_agent_id = alert_agent_id
+        self._alert_agent_name = alert_agent_name
+        self._alert_agent_count = alert_agent_count
+        self._alert_text = alert_text
+        self._refresh_tooltip()
+        self.update()
+
+    def _refresh_tooltip(self) -> None:
+        if self._has_alert:
+            head = (
+                f"{self._alert_agent_name} 有新通知"
+                if self._alert_agent_name
+                else "AI docker 有新通知"
+            )
+            if self._alert_agent_count > 1:
+                head += f"（共 {self._alert_agent_count} 个 Agent）"
+            lines = [head]
+            if self._alert_text:
+                lines.append(self._alert_text[:90])
+            elif self._notif_count > 0:
+                lines.append(f"共 {self._notif_count} 条未读通知")
+            lines.append("鼠标移入展开悬浮窗")
+            self.setToolTip("\n".join(lines))
+        else:
+            status = (
+                f"运行中 {self._running_count} 个窗口"
+                if self._running_count > 0
+                else "待机中"
+            )
+            self.setToolTip(f"AI docker  ·  {status}\n鼠标移入展开悬浮窗 · 右键打开设置")
+
+    def enterEvent(self, event) -> None:
+        self.hovered.emit()
+        super().enterEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        pal = get_palette(self._theme)
+
+        pad = float(self._shadow_pad)
+        rect = QRectF(pad, pad, self.width() - pad * 2.0, self.height() - pad * 2.0)
+        paint_apple_glass(painter, rect, radius=16.0, theme=self._theme, alpha=self._alpha)
+
+        if self._drop_highlight:
+            path = QPainterPath()
+            path.addRoundedRect(rect, 16.0, 16.0)
+            painter.setPen(QPen(pal["accent"], 2.0))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawPath(path)
+        elif self._has_alert:
+            alert_ring = QColor(pal["alert"])
+            alert_ring.setAlpha(185)
+            path = QPainterPath()
+            path.addRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), 15.5, 15.5)
+            painter.setPen(QPen(alert_ring, 1.5))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawPath(path)
+
+        # Centered crisp HiDPI icon (34x34)
+        draw_size = 34.0
+        dpr = self.devicePixelRatioF()
+        pm = self._icon.pixmap(
+            QSize(int(math.ceil(draw_size * dpr)), int(math.ceil(draw_size * dpr)))
+        )
+        if not pm.isNull():
+            pm.setDevicePixelRatio(dpr)
+            ix = rect.left() + (rect.width() - draw_size) / 2.0
+            iy = rect.top() + (rect.height() - draw_size) / 2.0 - (1.5 if self._running_count > 0 else 0.0)
+            painter.drawPixmap(QRectF(ix, iy, draw_size, draw_size), pm, QRectF(pm.rect()))
+
+        # Subtle running indicator dot at bottom of glass squircle
+        if self._running_count > 0:
+            dot_d = 4.0
+            dx = rect.left() + (rect.width() - dot_d) / 2.0
+            dy = rect.bottom() - 6.0
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(pal["running_dot_glow"])
+            painter.drawEllipse(QRectF(dx - 1.2, dy - 1.2, dot_d + 2.4, dot_d + 2.4))
+            painter.setBrush(pal["running_dot"])
+            painter.drawEllipse(QRectF(dx, dy, dot_d, dot_d))
+
+        # Crisp Apple red notification badge in top-right corner
+        if self._has_alert:
+            badge_text = ""
+            if self._notif_count > 0:
+                badge_text = "9+" if self._notif_count > 9 else str(self._notif_count)
+            bh = 16.0 if badge_text else 10.0
+            bw = 21.0 if len(badge_text) > 1 else bh
+            bx = self.width() - bw - 2.0
+            by = 2.0
+            badge_rect = QRectF(bx, by, bw, bh)
+
+            painter.setBrush(pal["alert"])
+            painter.setPen(QPen(pal["badge_cutout"], 1.6))
+            painter.drawRoundedRect(badge_rect, bh / 2.0, bh / 2.0)
+
+            if badge_text:
+                font = QFont("Segoe UI", 7, QFont.Bold)
+                painter.setFont(font)
+                painter.setPen(QColor("#ffffff"))
+                painter.drawText(badge_rect, Qt.AlignCenter, badge_text)
+
+        painter.end()
+
+
 class AgentDockWindow(QWidget):
     """Apple macOS-inspired two-tier floating glass dock with drag-drop, auto-discovery & dual theme."""
 
@@ -930,6 +1096,14 @@ class AgentDockWindow(QWidget):
         self._shellhook_msg: int = 0
         self._shellhook_registered: bool = False
         self._cached_hwnd: int = 0
+
+        self._collapsed: bool = False
+        self._collapsed_anchor: QPoint | None = None
+        self._menu_open: bool = False
+        self._dialog_open: bool = False
+        self._prev_alert_meta: dict[str, tuple[int, str]] = {}
+        self._alert_order: list[str] = []
+        self._default_app_icon: QIcon = self._load_default_app_icon()
 
         app = QApplication.instance()
         if app is not None:
@@ -949,6 +1123,16 @@ class AgentDockWindow(QWidget):
         self._root_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
 
         theme = self._theme()
+        self._orb = CollapsedDockOrb(
+            icon=self._default_app_icon,
+            theme=theme,
+            alpha=self._capsule_alpha(),
+            parent=self,
+        )
+        self._orb.hovered.connect(self._expand_dock)
+        self._orb.hide()
+        self._root_layout.addWidget(self._orb, 0, Qt.AlignLeft)
+
         self._top_bar = TopDockCapsule(theme=theme, alpha=self._capsule_alpha(), parent=self)
         self._top_bar.reorder_requested.connect(self._move_agent_to_visible_index)
         self._grip = DragGrip(
@@ -970,12 +1154,116 @@ class AgentDockWindow(QWidget):
         self._apply_styles()
         self._rebuild_dock(force_refresh_icons=False)
         self._restore_position()
+        self._collapsed_anchor = self.pos()
+
+        self._collapse_timer = QTimer(self)
+        self._collapse_timer.setSingleShot(True)
+        self._collapse_timer.timeout.connect(self._try_auto_collapse)
 
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(1200)
         self._status_timer.timeout.connect(self._refresh_state)
         self._status_timer.start()
         QTimer.singleShot(200, self._refresh_state)
+        if self._auto_collapse_enabled():
+            self._schedule_auto_collapse()
+
+    @staticmethod
+    def _load_default_app_icon() -> QIcon:
+        for rel in ("assets/ai_docker.png", "assets/ai_docker.ico"):
+            candidate = PROJECT_ROOT / rel
+            if candidate.exists():
+                icon = QIcon(str(candidate))
+                if not icon.isNull():
+                    return icon
+        return QIcon()
+
+    def _auto_collapse_enabled(self) -> bool:
+        return bool(self.config["ui"].get("auto_collapse", True))
+
+    def _auto_collapse_seconds(self) -> int:
+        try:
+            sec = int(self.config["ui"].get("auto_collapse_seconds", 8))
+        except (TypeError, ValueError):
+            sec = 8
+        return max(2, min(300, sec))
+
+    def _is_interaction_busy(self) -> bool:
+        return bool(
+            self.underMouse()
+            or self._menu_open
+            or self._dialog_open
+            or (self._drag_offset is not None)
+            or (self._top_bar._reordering_btn is not None)
+        )
+
+    def _schedule_auto_collapse(self) -> None:
+        if not self._auto_collapse_enabled() or self._collapsed or self._is_interaction_busy():
+            return
+        self._collapse_timer.start(self._auto_collapse_seconds() * 1000)
+
+    def _cancel_auto_collapse(self) -> None:
+        self._collapse_timer.stop()
+
+    def _try_auto_collapse(self) -> None:
+        if not self._auto_collapse_enabled() or self._collapsed or self._is_interaction_busy():
+            return
+        self._collapse_dock()
+
+    def _collapse_dock(self, force: bool = False) -> None:
+        if self._collapsed:
+            return
+        if not force and self._is_interaction_busy():
+            return
+        self._cancel_auto_collapse()
+        if self._collapsed_anchor is None:
+            self._collapsed_anchor = self.pos()
+        self._top_bar.hide()
+        self._shelf.hide()
+        self._orb.show()
+        self._collapsed = True
+        self.adjustSize()
+        self.move(self._collapsed_anchor)
+        self.update()
+
+    def _expand_dock(self) -> None:
+        self._cancel_auto_collapse()
+        if not self._collapsed:
+            return
+        self._collapsed_anchor = self.pos()
+        self._orb.hide()
+        self._top_bar.show()
+        show_list = bool(self.config["ui"].get("show_window_list", True))
+        if show_list and self._shelf_layout.count() > 0:
+            self._shelf.show()
+        else:
+            self._shelf.hide()
+        self._collapsed = False
+        self.adjustSize()
+
+        # Clamp expanded dock inside current screen so right/bottom-edge orbs expand cleanly
+        anchor = self._collapsed_anchor
+        target_x = anchor.x()
+        target_y = anchor.y()
+        screen = QGuiApplication.screenAt(anchor + QPoint(24, 24)) or QGuiApplication.primaryScreen()
+        if screen is not None:
+            geo = screen.availableGeometry()
+            max_x = geo.right() - self.width() + 1
+            max_y = geo.bottom() - self.height() + 1
+            target_x = max(geo.left(), min(target_x, max_x))
+            target_y = max(geo.top(), min(target_y, max_y))
+        self.move(target_x, target_y)
+        self.update()
+
+    def enterEvent(self, event) -> None:
+        self._cancel_auto_collapse()
+        if self._collapsed:
+            self._expand_dock()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._schedule_auto_collapse()
+        super().leaveEvent(event)
 
     @property
     def _columns(self) -> list[AgentIconButton]:
@@ -1030,17 +1318,22 @@ class AgentDockWindow(QWidget):
             for url in event.mimeData().urls():
                 local = url.toLocalFile()
                 if local and local.lower().endswith((".exe", ".lnk")):
+                    self._cancel_auto_collapse()
                     self._top_bar.set_drop_highlight(True)
+                    self._orb.set_drop_highlight(True)
                     event.acceptProposedAction()
                     return
         event.ignore()
 
     def dragLeaveEvent(self, event: QDragLeaveEvent) -> None:
         self._top_bar.set_drop_highlight(False)
+        self._orb.set_drop_highlight(False)
+        self._schedule_auto_collapse()
         super().dragLeaveEvent(event)
 
     def dropEvent(self, event: QDropEvent) -> None:
         self._top_bar.set_drop_highlight(False)
+        self._orb.set_drop_highlight(False)
         added = 0
         existing_paths = {
             os.path.normcase(os.path.normpath(a.get("path", "")))
@@ -1069,15 +1362,19 @@ class AgentDockWindow(QWidget):
 
         if added > 0:
             save_config(self.config)
+            if self._collapsed:
+                self._expand_dock()
             top_left = self.pos()
             self._rebuild_dock(force_refresh_icons=False)
             self.move(top_left)
             self._refresh_state()
+            self._schedule_auto_collapse()
             event.acceptProposedAction()
 
     def _apply_styles(self) -> None:
         theme = self._theme()
         pal = get_palette(theme)
+        self._orb.set_theme_and_alpha(theme, self._capsule_alpha())
         self._top_bar.set_theme_and_alpha(theme, self._capsule_alpha())
         self._grip.set_theme(theme)
         for btn in self._buttons.values():
@@ -1239,7 +1536,8 @@ class AgentDockWindow(QWidget):
                 card.window_right_clicked.connect(self._on_window_chip_right_clicked)
                 self._shelf_layout.addWidget(card, 0, Qt.AlignTop)
             self._shelf.adjustSize()
-            self._shelf.show()
+            if not self._collapsed:
+                self._shelf.show()
         else:
             self._shelf.hide()
 
@@ -1266,6 +1564,73 @@ class AgentDockWindow(QWidget):
         self.config["ui"]["pos"] = [pos.x(), pos.y()]
         save_config(self.config)
 
+    def _update_orb_state(
+        self,
+        agents: list[dict[str, Any]],
+        notif_map: dict[str, AgentNotificationSummary],
+    ) -> None:
+        """Keep the collapsed floating orb synced with the most recently notifying Agent."""
+        enabled_by_id: dict[str, dict[str, Any]] = {
+            a.get("id", ""): a
+            for a in agents
+            if a.get("enabled", True) is not False and a.get("id")
+        }
+
+        alerting_ids: set[str] = set()
+        new_meta: dict[str, tuple[int, str]] = {}
+        total_notif_count = 0
+
+        for aid in enabled_by_id:
+            summary = notif_map.get(aid)
+            if summary is not None and summary.has_alert:
+                alerting_ids.add(aid)
+                total_notif_count += summary.total_count
+                cur_meta = (summary.total_count, summary.latest_text)
+                new_meta[aid] = cur_meta
+                prev = self._prev_alert_meta.get(aid)
+                is_new_event = (
+                    prev is None
+                    or cur_meta[0] > prev[0]
+                    or (cur_meta[1] and cur_meta[1] != prev[1])
+                )
+                if is_new_event:
+                    if aid in self._alert_order:
+                        self._alert_order.remove(aid)
+                    self._alert_order.append(aid)
+
+        self._alert_order = [aid for aid in self._alert_order if aid in alerting_ids]
+        for aid in alerting_ids:
+            if aid not in self._alert_order:
+                self._alert_order.append(aid)
+        self._prev_alert_meta = new_meta
+
+        running_count = sum(
+            len(self._agent_windows.get(aid, [])) for aid in enabled_by_id
+        )
+
+        if self._alert_order:
+            latest_aid = self._alert_order[-1]
+            latest_agent = enabled_by_id.get(latest_aid, {})
+            latest_summary = notif_map.get(latest_aid, AgentNotificationSummary())
+            icon = self._icons.get(latest_aid) or self._default_app_icon
+            self._orb.update_state(
+                icon=icon,
+                running_count=running_count,
+                notif_count=total_notif_count,
+                has_alert=True,
+                alert_agent_id=latest_aid,
+                alert_agent_name=latest_agent.get("name", latest_aid),
+                alert_agent_count=len(self._alert_order),
+                alert_text=latest_summary.latest_text,
+            )
+        else:
+            self._orb.update_state(
+                icon=self._default_app_icon,
+                running_count=running_count,
+                notif_count=0,
+                has_alert=False,
+            )
+
     def _refresh_state(self) -> None:
         ui = self.config["ui"]
         show_dot = bool(ui.get("show_running_dot", True))
@@ -1291,6 +1656,8 @@ class AgentDockWindow(QWidget):
                 released_to_taskbar=released,
             )
 
+        self._update_orb_state(agents, notif_map)
+
         shelf_changed = self._rebuild_shelf(
             agents=agents,
             agent_windows=self._agent_windows,
@@ -1298,7 +1665,7 @@ class AgentDockWindow(QWidget):
             notif_map=notif_map,
             show_list=show_list,
         )
-        if shelf_changed:
+        if shelf_changed and not self._collapsed:
             top_left = self.pos()
             self.adjustSize()
             self.move(top_left)
@@ -1522,6 +1889,27 @@ class AgentDockWindow(QWidget):
         theme_act = menu.addAction("切换外观：macOS 浅色毛玻璃" if is_dark else "切换外观：macOS 深色磨砂")
         theme_act.triggered.connect(self._toggle_theme)
 
+        collapse_now_act = menu.addAction(
+            "立即展开悬浮窗" if self._collapsed else "立即收缩为悬浮图标"
+        )
+        collapse_now_act.triggered.connect(self._toggle_collapsed_now)
+
+        auto_collapse_on = self._auto_collapse_enabled()
+        auto_collapse_act = menu.addAction("空闲自动收缩为悬浮图标")
+        auto_collapse_act.setCheckable(True)
+        auto_collapse_act.setChecked(auto_collapse_on)
+        auto_collapse_act.triggered.connect(self._toggle_auto_collapse)
+
+        cur_sec = self._auto_collapse_seconds()
+        delay_menu = menu.addMenu(f"自动收缩等待时间（{cur_sec} 秒）")
+        for sec in (5, 8, 15, 30):
+            d_act = delay_menu.addAction(f"{sec} 秒")
+            d_act.setCheckable(True)
+            d_act.setChecked(cur_sec == sec)
+            d_act.triggered.connect(
+                lambda checked=False, s=sec: self._set_auto_collapse_seconds(s)
+            )
+
         show_list_action = menu.addAction("下方展开已打开项目窗口")
         show_list_action.setCheckable(True)
         show_list_action.setChecked(bool(self.config["ui"].get("show_window_list", True)))
@@ -1571,27 +1959,66 @@ class AgentDockWindow(QWidget):
             if agent is not None
             else self._build_global_menu()
         )
-        menu.exec(global_pos)
+        self._menu_open = True
+        self._cancel_auto_collapse()
+        try:
+            menu.exec(global_pos)
+        finally:
+            self._menu_open = False
+            self._schedule_auto_collapse()
 
     def _open_discover_dialog(self) -> None:
-        dlg = DiscoverAgentsDialog(self.config.get("agents", []), theme=self._theme(), parent=self)
-        if dlg.exec() and dlg.selected_agents:
-            self.config["agents"].extend(dlg.selected_agents)
-            save_config(self.config)
-            top_left = self.pos()
-            self._rebuild_dock(force_refresh_icons=False)
-            self.move(top_left)
-            self._refresh_state()
+        self._dialog_open = True
+        self._cancel_auto_collapse()
+        try:
+            dlg = DiscoverAgentsDialog(self.config.get("agents", []), theme=self._theme(), parent=self)
+            if dlg.exec() and dlg.selected_agents:
+                self.config["agents"].extend(dlg.selected_agents)
+                save_config(self.config)
+                top_left = self.pos()
+                self._rebuild_dock(force_refresh_icons=False)
+                self.move(top_left)
+                self._refresh_state()
+        finally:
+            self._dialog_open = False
+            self._schedule_auto_collapse()
 
     def _open_add_dialog(self) -> None:
-        dlg = AddAgentDialog(self.config.get("agents", []), theme=self._theme(), parent=self)
-        if dlg.exec() and dlg.created_agent:
-            self.config["agents"].append(dlg.created_agent)
-            save_config(self.config)
-            top_left = self.pos()
-            self._rebuild_dock(force_refresh_icons=False)
-            self.move(top_left)
-            self._refresh_state()
+        self._dialog_open = True
+        self._cancel_auto_collapse()
+        try:
+            dlg = AddAgentDialog(self.config.get("agents", []), theme=self._theme(), parent=self)
+            if dlg.exec() and dlg.created_agent:
+                self.config["agents"].append(dlg.created_agent)
+                save_config(self.config)
+                top_left = self.pos()
+                self._rebuild_dock(force_refresh_icons=False)
+                self.move(top_left)
+                self._refresh_state()
+        finally:
+            self._dialog_open = False
+            self._schedule_auto_collapse()
+
+    def _toggle_collapsed_now(self) -> None:
+        if self._collapsed:
+            self._expand_dock()
+        else:
+            self._collapse_dock(force=True)
+
+    def _toggle_auto_collapse(self, checked: bool) -> None:
+        self.config["ui"]["auto_collapse"] = bool(checked)
+        save_config(self.config)
+        if not checked:
+            self._cancel_auto_collapse()
+            self._expand_dock()
+        else:
+            self._schedule_auto_collapse()
+
+    def _set_auto_collapse_seconds(self, seconds: int) -> None:
+        self.config["ui"]["auto_collapse_seconds"] = max(2, int(seconds))
+        self.config["ui"]["auto_collapse"] = True
+        save_config(self.config)
+        self._schedule_auto_collapse()
 
     def _toggle_theme(self) -> None:
         self.config["ui"]["theme"] = "light" if self._theme() == "dark" else "dark"
@@ -1742,6 +2169,11 @@ class AgentDockWindow(QWidget):
         self._rebuild_dock(force_refresh_icons=True)
         self.move(top_left)
         self._refresh_state()
+        if not self._auto_collapse_enabled():
+            self._cancel_auto_collapse()
+            self._expand_dock()
+        else:
+            self._schedule_auto_collapse()
 
     def _toggle_autostart(self, checked: bool) -> None:
         try:
@@ -1751,6 +2183,10 @@ class AgentDockWindow(QWidget):
 
     def _cleanup_resources(self) -> None:
         atexit.unregister(self._cleanup_resources)
+        if hasattr(self, "_collapse_timer"):
+            self._collapse_timer.stop()
+        if hasattr(self, "_status_timer"):
+            self._status_timer.stop()
         if self._shellhook_registered and self._cached_hwnd:
             try:
                 user32.DeregisterShellHookWindow(wintypes.HWND(self._cached_hwnd))
@@ -1767,9 +2203,10 @@ class AgentDockWindow(QWidget):
         self._cleanup_resources()
         super().closeEvent(event)
 
-    # --- Window dragging (left grip & empty capsule area) ---
+    # --- Window dragging (left grip, empty capsule area & collapsed orb) ---
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
+            self._cancel_auto_collapse()
             self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
             event.accept()
             return
@@ -1785,7 +2222,9 @@ class AgentDockWindow(QWidget):
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.LeftButton and self._drag_offset is not None:
             self._drag_offset = None
+            self._collapsed_anchor = self.pos()
             self._save_position()
+            self._schedule_auto_collapse()
             event.accept()
             return
         super().mouseReleaseEvent(event)
