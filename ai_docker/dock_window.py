@@ -1751,7 +1751,7 @@ class AgentDockWindow(QWidget):
             for w in open_wins[:8]:
                 proj = w.get("project") or w.get("title") or name or "窗口"
                 hwnd = w["hwnd"]
-                act = menu.addAction(f"切换到：{proj}")
+                act = menu.addAction(f"切换到窗口：{proj}")
                 act.triggered.connect(
                     lambda checked=False, h=hwnd, a=aid: self._on_window_chip_clicked(h, a)
                 )
@@ -1832,14 +1832,35 @@ class AgentDockWindow(QWidget):
         return menu
 
     def _build_global_menu(self) -> QMenu:
-        """Context menu for the drag grip / empty capsule area (global AI docker settings)."""
+        """Compact grouped context menu for the drag grip / empty capsule / collapsed orb."""
         menu = AppleGlassMenu(theme=self._theme(), alpha=self._capsule_alpha(), parent=self)
 
-        discover_act = menu.addAction("扫描本机新安装的 Agent...")
+        # 1. Quick actions
+        collapse_now_act = menu.addAction(
+            "立即展开悬浮窗" if self._collapsed else "立即收缩为悬浮图标"
+        )
+        collapse_now_act.triggered.connect(self._toggle_collapsed_now)
+
+        is_dark = self._theme() == "dark"
+        theme_act = menu.addAction("切换外观：macOS 浅色毛玻璃" if is_dark else "切换外观：macOS 深色磨砂")
+        theme_act.triggered.connect(self._toggle_theme)
+
+        has_any_alert = any(s.has_alert for s in self._last_notif_map.values())
+        clear_all_action = menu.addAction("清除全部通知角标")
+        clear_all_action.setEnabled(has_any_alert)
+        clear_all_action.triggered.connect(self._clear_all_notifications)
+
+        menu.addSeparator()
+
+        # 2. Grouped submenus
+        agent_menu = menu.addMenu("Agent 管理")
+        discover_act = agent_menu.addAction("扫描本机新安装的 Agent...")
         discover_act.triggered.connect(self._open_discover_dialog)
 
-        add_act = menu.addAction("添加新 Agent...（或直接拖入 .exe/.lnk）")
+        add_act = agent_menu.addAction("添加新 Agent...（或直接拖入 .exe/.lnk）")
         add_act.triggered.connect(self._open_add_dialog)
+
+        agent_menu.addSeparator()
 
         all_agents = self.config.get("agents", [])
         hidden_count = sum(1 for a in all_agents if a.get("enabled", True) is False)
@@ -1848,7 +1869,7 @@ class AgentDockWindow(QWidget):
             if hidden_count > 0
             else "显示 / 隐藏图标"
         )
-        vis_menu = menu.addMenu(vis_title)
+        vis_menu = agent_menu.addMenu(vis_title)
         visible_total = len(all_agents) - hidden_count
         for item_agent in all_agents:
             item_id = item_agent.get("id", "")
@@ -1875,7 +1896,7 @@ class AgentDockWindow(QWidget):
             if released_count > 0
             else "释放指定 Agent 到任务栏"
         )
-        rel_menu = menu.addMenu(rel_title)
+        rel_menu = agent_menu.addMenu(rel_title)
         for item_agent in enabled_agents:
             item_id = item_agent.get("id", "")
             item_name = item_agent.get("name", item_id)
@@ -1891,25 +1912,15 @@ class AgentDockWindow(QWidget):
             reclaim_all_act = rel_menu.addAction("全部重新收进悬浮窗")
             reclaim_all_act.triggered.connect(self._reclaim_all_released)
 
-        menu.addSeparator()
-
-        is_dark = self._theme() == "dark"
-        theme_act = menu.addAction("切换外观：macOS 浅色毛玻璃" if is_dark else "切换外观：macOS 深色磨砂")
-        theme_act.triggered.connect(self._toggle_theme)
-
-        collapse_now_act = menu.addAction(
-            "立即展开悬浮窗" if self._collapsed else "立即收缩为悬浮图标"
-        )
-        collapse_now_act.triggered.connect(self._toggle_collapsed_now)
-
+        behavior_menu = menu.addMenu("显示与行为")
         auto_collapse_on = self._auto_collapse_enabled()
-        auto_collapse_act = menu.addAction("空闲自动收缩为悬浮图标")
+        auto_collapse_act = behavior_menu.addAction("空闲自动收缩为悬浮图标")
         auto_collapse_act.setCheckable(True)
         auto_collapse_act.setChecked(auto_collapse_on)
         auto_collapse_act.triggered.connect(self._toggle_auto_collapse)
 
         cur_sec = self._auto_collapse_seconds()
-        delay_menu = menu.addMenu(f"自动收缩等待时间（{cur_sec} 秒）")
+        delay_menu = behavior_menu.addMenu(f"自动收缩等待时间（{cur_sec} 秒）")
         for sec in (5, 8, 15, 30):
             d_act = delay_menu.addAction(f"{sec} 秒")
             d_act.setCheckable(True)
@@ -1918,39 +1929,40 @@ class AgentDockWindow(QWidget):
                 lambda checked=False, s=sec: self._set_auto_collapse_seconds(s)
             )
 
-        show_list_action = menu.addAction("下方展开已打开项目窗口")
+        behavior_menu.addSeparator()
+
+        show_list_action = behavior_menu.addAction("下方展开已打开项目窗口")
         show_list_action.setCheckable(True)
         show_list_action.setChecked(bool(self.config["ui"].get("show_window_list", True)))
         show_list_action.triggered.connect(self._toggle_show_window_list)
 
-        hide_action = menu.addAction("自动隐藏已收纳 Agent 的任务栏图标")
+        hide_action = behavior_menu.addAction("自动隐藏已收纳 Agent 的任务栏图标")
         hide_action.setCheckable(True)
         hide_action.setChecked(bool(self.config["ui"].get("hide_from_taskbar", True)))
         hide_action.triggered.connect(self._toggle_hide_from_taskbar)
 
-        focus_action = menu.addAction("点击图标时优先唤醒已开窗口")
+        focus_action = behavior_menu.addAction("点击图标时优先唤醒已开窗口")
         focus_action.setCheckable(True)
         focus_action.setChecked(bool(self.config["ui"].get("focus_existing", True)))
         focus_action.triggered.connect(self._toggle_focus_existing)
 
-        clear_all_action = menu.addAction("清除全部通知角标")
-        clear_all_action.triggered.connect(self._clear_all_notifications)
-
-        menu.addSeparator()
-
-        reload_action = menu.addAction("重新加载配置与图标")
+        system_menu = menu.addMenu("配置与系统")
+        reload_action = system_menu.addAction("重新加载配置与图标")
         reload_action.triggered.connect(self._reload_all)
 
-        edit_action = menu.addAction("打开配置文件 (agents.json)")
+        edit_action = system_menu.addAction("打开配置文件 (agents.json)")
         edit_action.triggered.connect(lambda: os.startfile(str(CONFIG_PATH)))
 
-        menu.addSeparator()
+        system_menu.addSeparator()
 
-        autostart_action = menu.addAction("开机自动启动")
+        autostart_action = system_menu.addAction("开机自动启动")
         autostart_action.setCheckable(True)
         autostart_action.setChecked(is_autostart_enabled())
         autostart_action.triggered.connect(self._toggle_autostart)
 
+        menu.addSeparator()
+
+        # 3. Exit
         quit_action = menu.addAction("退出 AI docker (还原任务栏图标)")
         quit_action.setProperty("destructive", True)
         quit_action.triggered.connect(self._quit_app)

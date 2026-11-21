@@ -470,17 +470,21 @@ class WindowsTests(unittest.TestCase):
                 dock = dock_window.AgentDockWindow()
                 dock._status_timer.stop()
                 try:
+                    def check_menu_tree(m):
+                        self.assertIsInstance(m, AppleGlassMenu)
+                        self.assertEqual(m._theme, theme)
+                        self.assertTrue(m.testAttribute(Qt.WA_TranslucentBackground))
+                        self.assertTrue(bool(m.windowFlags() & Qt.FramelessWindowHint))
+                        for act in m.actions():
+                            if act.menu() is not None:
+                                check_menu_tree(act.menu())
+
                     gmenu = dock._build_global_menu()
                     amenu = dock._build_agent_menu(config["agents"][0])
-                    for menu in (gmenu, amenu):
-                        self.assertIsInstance(menu, AppleGlassMenu)
-                        self.assertEqual(menu._theme, theme)
-                        self.assertTrue(menu.testAttribute(Qt.WA_TranslucentBackground))
-                        self.assertTrue(bool(menu.windowFlags() & Qt.FramelessWindowHint))
-                        for act in menu.actions():
-                            if act.menu() is not None:
-                                self.assertIsInstance(act.menu(), AppleGlassMenu)
-                                self.assertEqual(act.menu()._theme, theme)
+                    top_submenus = [a.text() for a in gmenu.actions() if a.menu() is not None]
+                    self.assertEqual(top_submenus, ["Agent 管理", "显示与行为", "配置与系统"])
+                    check_menu_tree(gmenu)
+                    check_menu_tree(amenu)
                     gmenu.deleteLater()
                     amenu.deleteLater()
                 finally:
