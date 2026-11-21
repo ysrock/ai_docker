@@ -45,6 +45,12 @@
   - 在左侧拖动区（`DragGrip` 或顶栏空白边缘）右键显示全局 `AI docker` 菜单（`_build_global_menu`）；
   - 在顶部 Agent 图标或下方项目行上右键仅显示针对该 Agent / 窗口的专属精简菜单（`_build_agent_menu`），且仅在存在未读通知时才展示消角标项。
 
+### 里程碑 7：全量代码审查与健壮性加固
+- **Win32 64 位句柄与错误码规范化**：`main.py` 改用 `WinDLL("kernel32", use_last_error=True)` + `ctypes.get_last_error()` 并显式声明 `CreateMutexW`/`CloseHandle` 签名，退出 `finally` 释放互斥锁；`ai_docker/icons.py` 补全 `GetPackagesByPackageFamily` / `GetPackagePathByFullName` 签名并限制网页图标拉取仅允许 `http`/`https`（超时收敛为 2s）。
+- **配置原子写入与异常容错**：`ai_docker/config.py` 改用同目录临时文件 + `os.replace()` 原子落盘，新增 `ConfigLoadError`；`_reload_all()` 捕获非法 JSON 并保留当前配置，避免手改配置出错导致崩溃。
+- **稳定性与边界修复**：`launcher.py` 捕获子进程 `OSError`；`dock_window.py` 修复拖动区右键双重弹菜单、缓存 `_cached_hwnd` 并注销 `atexit` 防止 Qt 析构后异常、清理无用死代码；`notifications.py` 增加通知库 ID 回落水位线自愈与手动消角标后的 Windows Badge 去重抑制；`discovery.py` 复用单次 `WScript.Shell` COM 实例加速扫描。
+- **模块拆分**：将主题色板与玻璃绘制抽离为独立模块 `ai_docker/theme.py`。
+
 ## 后续规划
 - 支持自定义全局快捷键呼出/切换悬浮窗。
 - 可选屏幕边缘自动贴边收起与鼠标触边呼出模式。

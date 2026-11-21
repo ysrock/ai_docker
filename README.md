@@ -85,6 +85,7 @@ ai_docker/
 │   ├── taskbar.py                # 基于 ITaskbarList 的任务栏隐藏与安全还原
 │   ├── notifications.py          # WPN 通知库 + Shell Hook + 标题未读聚合追踪
 │   ├── dialogs.py                # 扫描导入弹窗与手动添加弹窗
+│   ├── theme.py                  # macOS 深/浅色主题色板与毛玻璃表面绘制
 │   └── dock_window.py            # 双层毛玻璃 HUD、60fps 波浪放大与交互控制
 └── docs/
     ├── ARCHITECTURE.md           # 模块架构与 Windows 底层机制说明

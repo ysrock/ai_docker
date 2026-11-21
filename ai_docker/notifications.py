@@ -94,6 +94,8 @@ class NotificationTracker:
         self._window_toast_texts: dict[int, str] = {}
         self._agent_toast_counts: dict[str, int] = {}
         self._agent_toast_texts: dict[str, str] = {}
+        self._last_active_badges: dict[str, int] = {}
+        self._dismissed_badge_counts: dict[str, int] = {}
 
     def _connect_ro(self) -> sqlite3.Connection | None:
         if not self._db_path.exists():
@@ -128,10 +130,16 @@ class NotificationTracker:
         if agent_id:
             self._agent_toast_counts.pop(agent_id, None)
             self._agent_toast_texts.pop(agent_id, None)
+            cur_badge = self._last_active_badges.get(agent_id, 0)
+            if cur_badge > 0:
+                self._dismissed_badge_counts[agent_id] = cur_badge
 
     def clear_agent(self, agent_id: str, hwnds: list[int] | None = None) -> None:
         self._agent_toast_counts.pop(agent_id, None)
         self._agent_toast_texts.pop(agent_id, None)
+        cur_badge = self._last_active_badges.get(agent_id, 0)
+        if cur_badge > 0:
+            self._dismissed_badge_counts[agent_id] = cur_badge
         if hwnds:
             for h in hwnds:
                 self._flashing_hwnds.discard(h)
@@ -178,7 +186,13 @@ class NotificationTracker:
                         aid = ag.get("id", "")
                         active_badges[aid] = max(active_badges.get(aid, 0), cnt)
 
-            # 2. Read newly arrived toast notifications since watermark
+            # 2. Self-heal watermark if Windows recreated/purged Notification DB
+            max_row = conn.execute("SELECT COALESCE(MAX(Id), 0) FROM Notification").fetchone()
+            db_max_id = int(max_row[0]) if max_row and max_row[0] else 0
+            if db_max_id < self._last_toast_id:
+                self._last_toast_id = db_max_id
+
+            # 3. Read newly arrived toast notifications since watermark
             toast_rows = conn.execute(
                 """
                 SELECT n.Id, h.PrimaryId, n.Payload
@@ -271,6 +285,12 @@ class NotificationTracker:
                 self._window_toast_texts.pop(h, None)
 
         active_badges = self._poll_wpn_db(agents, agent_windows, foreground_hwnd)
+        self._last_active_badges = dict(active_badges)
+        # Clear dismissed marker when badge count drops to 0 or changes
+        for aid, dismissed_val in list(self._dismissed_badge_counts.items()):
+            cur_val = active_badges.get(aid, 0)
+            if cur_val == 0 or cur_val != dismissed_val:
+                self._dismissed_badge_counts.pop(aid, None)
 
         summaries: dict[str, AgentNotificationSummary] = {}
         for agent in agents:
@@ -305,7 +325,8 @@ class NotificationTracker:
                         latest_text = w_text
 
             agent_unassigned = self._agent_toast_counts.get(aid, 0)
-            badge_cnt = active_badges.get(aid, 0)
+            raw_badge = active_badges.get(aid, 0)
+            badge_cnt = 0 if raw_badge and self._dismissed_badge_counts.get(aid) == raw_badge else raw_badge
             total = max(win_total + agent_unassigned, badge_cnt)
 
             # If an agent has a single open window and an agent-level alert/badge, mirror it onto that window too

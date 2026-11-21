@@ -14,7 +14,8 @@
 | `ai_docker/taskbar.py` | 通过 `pywin32` 原生 `ITaskbarList` COM 接口管理运行中窗口的任务栏隐藏（`DeleteTab`）与还原（`AddTab`），内置 `Shell_TrayWnd` 句柄变化检测以兼容 `explorer.exe` 重启 |
 | `ai_docker/notifications.py` | 聚合 Windows 本地通知库 `wpndatabase.db` 水位线增量 Toast/Badge、Windows Shell Hook `HSHELL_FLASH` 闪烁事件与窗口标题未读数字，并按项目名归属到具体窗口 |
 | `ai_docker/dialogs.py` | 适配深/浅双主题的本机扫描导入弹窗（`DiscoverAgentsDialog`）与手动添加弹窗（`AddAgentDialog`） |
-| `ai_docker/dock_window.py` | 双层毛玻璃 HUD 主窗口（`TopDockCapsule` + `AgentWorkspaceCard`）、60fps 余弦波浪放大动画、文件拖放接收、右键菜单与全局状态轮询 |
+| `ai_docker/theme.py` | macOS 深色磨砂 / 浅色毛玻璃色板定义与 `paint_apple_glass` 玻璃质感绘制 |
+| `ai_docker/dock_window.py` | 双层毛玻璃 HUD 主窗口（`TopDockCapsule` + `AgentWorkspaceCard`）、60fps 余弦波浪放大动画、文件拖放接收、分区右键菜单与全局状态轮询 |
 
 ## 2. 关键 Windows 底层机制
 

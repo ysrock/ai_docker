@@ -106,6 +106,21 @@ user32.GetDC.restype = wintypes.HDC
 user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
 user32.ReleaseDC.restype = ctypes.c_int
 
+kernel32.GetPackagesByPackageFamily.argtypes = [
+    wintypes.LPCWSTR,
+    ctypes.POINTER(wintypes.UINT),
+    ctypes.POINTER(wintypes.LPWSTR),
+    ctypes.POINTER(wintypes.UINT),
+    wintypes.LPWSTR,
+]
+kernel32.GetPackagesByPackageFamily.restype = wintypes.LONG
+kernel32.GetPackagePathByFullName.argtypes = [
+    wintypes.LPCWSTR,
+    ctypes.POINTER(wintypes.UINT),
+    wintypes.LPWSTR,
+]
+kernel32.GetPackagePathByFullName.restype = wintypes.LONG
+
 
 def _cache_key(prefix: str, value: str) -> Path:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -333,13 +348,18 @@ def fetch_web_icon_to_png(url: str, force: bool = False) -> Path | None:
     if cache_file.exists() and not force:
         return cache_file
 
-    scheme = parsed.scheme or "https"
+    scheme = parsed.scheme.lower()
+    if scheme and scheme not in ("http", "https"):
+        return None
+    scheme = scheme or "https"
     candidates = [
         f"https://www.google.com/s2/favicons?domain={host}&sz=128",
         f"{scheme}://{host}/apple-touch-icon.png",
         f"{scheme}://{host}/favicon.ico",
     ]
-    if url.lower().endswith((".png", ".ico", ".jpg", ".jpeg", ".webp")):
+    if url.lower().startswith(("http://", "https://")) and url.lower().endswith(
+        (".png", ".ico", ".jpg", ".jpeg", ".webp")
+    ):
         candidates.insert(0, url)
 
     headers = {
@@ -351,7 +371,7 @@ def fetch_web_icon_to_png(url: str, force: bool = False) -> Path | None:
     for cand in candidates:
         try:
             req = urllib.request.Request(cand, headers=headers)
-            with urllib.request.urlopen(req, timeout=4) as resp:
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
                 data = resp.read()
             if not data:
                 continue

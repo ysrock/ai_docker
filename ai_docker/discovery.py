@@ -145,12 +145,13 @@ def _is_skipped_exe(name: str) -> bool:
     return any(tok in low for tok in SKIP_EXE_NAMES)
 
 
-def _resolve_lnk(lnk_path: Path) -> tuple[str, str]:
+def _resolve_lnk(lnk_path: Path, shell: Any = None) -> tuple[str, str]:
     """Return (target_exe_path, display_name) for a .lnk shortcut."""
     try:
-        import win32com.client
+        if shell is None:
+            import win32com.client
 
-        shell = win32com.client.Dispatch("WScript.Shell")
+            shell = win32com.client.Dispatch("WScript.Shell")
         sc = shell.CreateShortcut(str(lnk_path))
         target = (sc.Targetpath or "").strip()
         return target, lnk_path.stem
@@ -203,6 +204,14 @@ def _scan_shortcuts() -> list[tuple[str, str]]:
         programdata / "Microsoft/Windows/Start Menu/Programs",
     ]
     results: list[tuple[str, str]] = []
+    shell: Any = None
+    try:
+        import win32com.client
+
+        shell = win32com.client.Dispatch("WScript.Shell")
+    except Exception:
+        shell = None
+
     for root in roots:
         if not root.exists():
             continue
@@ -213,7 +222,7 @@ def _scan_shortcuts() -> list[tuple[str, str]]:
                     continue
                 if _is_skipped_exe(low):
                     continue
-                target, disp = _resolve_lnk(item)
+                target, disp = _resolve_lnk(item, shell=shell)
                 if target and target.lower().endswith(".exe") and Path(target).exists():
                     if not _is_skipped_exe(Path(target).name):
                         results.append((target, disp))

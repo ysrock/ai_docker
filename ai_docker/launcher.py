@@ -351,70 +351,73 @@ def launch_agent(agent: dict[str, Any], focus_existing: bool = True) -> tuple[bo
     atype = agent.get("type", "exe")
     creationflags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
 
-    if atype == "exe":
-        path = agent.get("path", "")
-        if not path or not Path(path).exists():
-            return False, f"找不到程序路径: {path}"
-        args = _build_exe_launch_args(agent, force_new=force_new)
-        cwd = agent.get("cwd") or str(Path(path).parent)
-        subprocess.Popen([path, *args], cwd=cwd, creationflags=creationflags)
-        return True, f"launched_exe:{path}"
+    try:
+        if atype == "exe":
+            path = agent.get("path", "")
+            if not path or not Path(path).exists():
+                return False, f"找不到程序路径: {path}"
+            args = _build_exe_launch_args(agent, force_new=force_new)
+            cwd = agent.get("cwd") or str(Path(path).parent)
+            subprocess.Popen([path, *args], cwd=cwd, creationflags=creationflags)
+            return True, f"launched_exe:{path}"
 
-    if atype == "msix":
-        aumid = agent.get("aumid", "")
-        if not aumid:
-            return False, "缺少 MSIX AUMID"
-        subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{aumid}"])
-        return True, f"launched_msix:{aumid}"
+        if atype == "msix":
+            aumid = agent.get("aumid", "")
+            if not aumid:
+                return False, "缺少 MSIX AUMID"
+            subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{aumid}"])
+            return True, f"launched_msix:{aumid}"
 
-    if atype == "cli":
-        command = agent.get("command", "")
-        if not command:
-            return False, "缺少 CLI 启动命令"
-        cwd = agent.get("cwd") or str(Path.home())
-        if not Path(cwd).exists():
-            cwd = str(Path.home())
-        title = agent.get("terminal_title") or agent.get("name") or "Agent CLI"
-        wt = shutil.which("wt")
-        pwsh = shutil.which("pwsh") or shutil.which("powershell") or "powershell.exe"
-        if wt:
-            cmd_list = [
-                wt,
-                "-w",
-                "new",
-                "new-tab",
-                "--title",
-                title,
-                "--suppressApplicationTitle",
-                "-d",
-                cwd,
-                pwsh,
-                "-NoLogo",
-                "-NoExit",
-                "-Command",
-                command,
-            ]
-            subprocess.Popen(cmd_list, cwd=cwd)
-        else:
-            subprocess.Popen(
-                [pwsh, "-NoLogo", "-NoExit", "-Command", command],
-                cwd=cwd,
-                creationflags=subprocess.CREATE_NEW_CONSOLE,
-            )
-        return True, f"launched_cli:{command}"
+        if atype == "cli":
+            command = agent.get("command", "")
+            if not command:
+                return False, "缺少 CLI 启动命令"
+            cwd = agent.get("cwd") or str(Path.home())
+            if not Path(cwd).exists():
+                cwd = str(Path.home())
+            title = agent.get("terminal_title") or agent.get("name") or "Agent CLI"
+            wt = shutil.which("wt")
+            pwsh = shutil.which("pwsh") or shutil.which("powershell") or "powershell.exe"
+            if wt:
+                cmd_list = [
+                    wt,
+                    "-w",
+                    "new",
+                    "new-tab",
+                    "--title",
+                    title,
+                    "--suppressApplicationTitle",
+                    "-d",
+                    cwd,
+                    pwsh,
+                    "-NoLogo",
+                    "-NoExit",
+                    "-Command",
+                    command,
+                ]
+                subprocess.Popen(cmd_list, cwd=cwd)
+            else:
+                subprocess.Popen(
+                    [pwsh, "-NoLogo", "-NoExit", "-Command", command],
+                    cwd=cwd,
+                    creationflags=subprocess.CREATE_NEW_CONSOLE,
+                )
+            return True, f"launched_cli:{command}"
 
-    if atype == "web":
-        url = agent.get("url", "")
-        if not url:
-            return False, "缺少网页 URL"
-        if agent.get("app_mode", True):
-            browser = _find_browser(agent.get("browser"))
-            if browser:
-                web_cmd = [browser, "--new-window", f"--app={url}"] if force_new else [browser, f"--app={url}"]
-                subprocess.Popen(web_cmd, creationflags=creationflags)
-                return True, f"launched_web_app:{url}"
-        webbrowser.open(url)
-        return True, f"launched_web:{url}"
+        if atype == "web":
+            url = agent.get("url", "")
+            if not url:
+                return False, "缺少网页 URL"
+            if agent.get("app_mode", True):
+                browser = _find_browser(agent.get("browser"))
+                if browser:
+                    web_cmd = [browser, "--new-window", f"--app={url}"] if force_new else [browser, f"--app={url}"]
+                    subprocess.Popen(web_cmd, creationflags=creationflags)
+                    return True, f"launched_web_app:{url}"
+            webbrowser.open(url)
+            return True, f"launched_web:{url}"
+    except OSError as exc:
+        return False, f"进程启动失败: {exc}"
 
     return False, f"未知类型: {atype}"
 
