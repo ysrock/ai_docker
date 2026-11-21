@@ -38,6 +38,9 @@
 - 升级 `ai_docker/dock_window.py` 与 `ai_docker/launcher.py` 支持**双击顶栏图标新开实例**：
   - `AgentIconButton` 增加 220ms 单击防抖与 `double_clicked` 信号，确保双击新开实例时不误触发单击切换，且不与拖拽换位冲突。
   - 强制新开时对 VS Code 系编辑器自动附加 `--new-window`（支持配置 `new_instance_args` 自定义），对独立网页应用自动附加 `--new-window --app=...`。
+- 新增**释放指定 Agent 到系统任务栏 / 重新收进悬浮窗**功能（`ai_docker/dock_window.py`）：
+  - 右键任意顶部图标或项目卡片可直接点击“释放到系统任务栏 / 重新收进悬浮窗”，立即通过 `ITaskbarList::AddTab` 还原该 Agent 所有运行窗口并写入 `hide_from_taskbar`。
+  - 右键全局菜单新增“释放指定 Agent 到任务栏”子菜单（显示已释放计数并支持“全部重新收进悬浮窗”）；已释放且运行中的 Agent 图标底部显示空心圆环以区别于已收纳的实心圆点。
 
 ## 后续规划
 - 支持自定义全局快捷键呼出/切换悬浮窗。

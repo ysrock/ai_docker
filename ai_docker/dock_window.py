@@ -306,6 +306,7 @@ class AgentIconButton(QWidget):
         self._notif_count = 0
         self._has_alert = False
         self._notif_text = ""
+        self._released_to_taskbar = False
         self._press_global: QPoint | None = None
         self._reordering = False
         self._suppress_next_release = False
@@ -352,6 +353,7 @@ class AgentIconButton(QWidget):
         notif_count: int,
         has_alert: bool,
         notif_text: str,
+        released_to_taskbar: bool = False,
     ) -> None:
         changed = (
             self._window_count != window_count
@@ -359,6 +361,7 @@ class AgentIconButton(QWidget):
             or self._notif_count != notif_count
             or self._has_alert != has_alert
             or self._notif_text != notif_text
+            or self._released_to_taskbar != released_to_taskbar
         )
         if changed:
             self._window_count = window_count
@@ -366,6 +369,7 @@ class AgentIconButton(QWidget):
             self._notif_count = notif_count
             self._has_alert = has_alert
             self._notif_text = notif_text
+            self._released_to_taskbar = released_to_taskbar
             self._refresh_tooltip()
             self.update()
 
@@ -378,6 +382,8 @@ class AgentIconButton(QWidget):
             status = "运行中 · 双击新开"
         else:
             status = type_label
+        if self._released_to_taskbar:
+            status += " · 已释放到任务栏"
         lines = [f"{name}  ·  {status}"]
         if self._has_alert:
             if self._notif_text:
@@ -512,16 +518,21 @@ class AgentIconButton(QWidget):
             y = max(2.0, base_y - lift)
             painter.drawPixmap(QRectF(x, y, draw_size, draw_size), pm, QRectF(pm.rect()))
 
-        # Classic Apple macOS 4px circular running dot at bottom
+        # Classic Apple macOS 4px circular running dot at bottom (hollow ring when released to taskbar)
         if self._window_count > 0 and self._show_running_dot:
-            painter.setPen(Qt.NoPen)
             dot_d = 4.0
             dx = (self.width() - dot_d) / 2.0
             dy = self.height() - 5.2
-            painter.setBrush(pal["running_dot_glow"])
-            painter.drawEllipse(QRectF(dx - 1.2, dy - 1.2, dot_d + 2.4, dot_d + 2.4))
-            painter.setBrush(pal["running_dot"])
-            painter.drawEllipse(QRectF(dx, dy, dot_d, dot_d))
+            if self._released_to_taskbar:
+                painter.setBrush(Qt.NoBrush)
+                painter.setPen(QPen(pal["running_dot"], 1.25))
+                painter.drawEllipse(QRectF(dx - 0.3, dy - 0.3, dot_d + 0.6, dot_d + 0.6))
+            else:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(pal["running_dot_glow"])
+                painter.drawEllipse(QRectF(dx - 1.2, dy - 1.2, dot_d + 2.4, dot_d + 2.4))
+                painter.setBrush(pal["running_dot"])
+                painter.drawEllipse(QRectF(dx, dy, dot_d, dot_d))
 
         # Crisp Apple red notification badge in top-right corner
         if self._has_alert:
@@ -1413,12 +1424,14 @@ class AgentDockWindow(QWidget):
         for aid, btn in self._buttons.items():
             wins = self._agent_windows.get(aid, [])
             summary = notif_map.get(aid, AgentNotificationSummary())
+            released = (not hide_enabled) or (btn.agent.get("hide_from_taskbar", True) is False)
             btn.update_state(
                 window_count=len(wins),
                 show_dot=show_dot,
                 notif_count=summary.total_count,
                 has_alert=summary.has_alert,
                 notif_text=summary.latest_text,
+                released_to_taskbar=released,
             )
 
         shelf_changed = self._rebuild_shelf(
@@ -1515,6 +1528,23 @@ class AgentDockWindow(QWidget):
             new_inst = menu.addAction(f"新开实例：{agent.get('name', '')}")
             new_inst.triggered.connect(lambda: launch_agent(agent, focus_existing=False))
 
+            is_released = agent.get("hide_from_taskbar", True) is False
+            global_hide = bool(self.config["ui"].get("hide_from_taskbar", True))
+            if is_released:
+                rel_act = menu.addAction(f"重新收进悬浮窗：{agent.get('name', '')}")
+                if not global_hide:
+                    rel_act.setText(f"重新收进悬浮窗：{agent.get('name', '')}（全局隐藏已关）")
+                    rel_act.setEnabled(False)
+                else:
+                    rel_act.triggered.connect(
+                        lambda checked=False, a=aid: self._set_agent_released(a, False)
+                    )
+            else:
+                rel_act = menu.addAction(f"释放到系统任务栏：{agent.get('name', '')}")
+                rel_act.triggered.connect(
+                    lambda checked=False, a=aid: self._set_agent_released(a, True)
+                )
+
             if target_hwnd is None:
                 visible_ids = [
                     a.get("id", "")
@@ -1591,6 +1621,29 @@ class AgentDockWindow(QWidget):
             vis_menu.addSeparator()
             show_all_act = vis_menu.addAction("全部显示")
             show_all_act.triggered.connect(self._show_all_agents)
+
+        enabled_agents = [a for a in all_agents if a.get("enabled", True) is not False]
+        released_count = sum(1 for a in enabled_agents if a.get("hide_from_taskbar", True) is False)
+        rel_title = (
+            f"释放指定 Agent 到任务栏（已释放 {released_count} 个）"
+            if released_count > 0
+            else "释放指定 Agent 到任务栏"
+        )
+        rel_menu = menu.addMenu(rel_title)
+        for item_agent in enabled_agents:
+            item_id = item_agent.get("id", "")
+            item_name = item_agent.get("name", item_id)
+            is_rel = item_agent.get("hide_from_taskbar", True) is False
+            act = rel_menu.addAction(item_name)
+            act.setCheckable(True)
+            act.setChecked(is_rel)
+            act.triggered.connect(
+                lambda checked=False, a=item_id: self._set_agent_released(a, bool(checked))
+            )
+        if released_count > 0:
+            rel_menu.addSeparator()
+            reclaim_all_act = rel_menu.addAction("全部重新收进悬浮窗")
+            reclaim_all_act.triggered.connect(self._reclaim_all_released)
 
         menu.addSeparator()
 
@@ -1743,8 +1796,40 @@ class AgentDockWindow(QWidget):
         save_config(self.config)
         if not checked:
             self._taskbar_hider.restore_all()
-        else:
-            self._refresh_state()
+        self._refresh_state()
+
+    def _set_agent_released(self, agent_id: str, released: bool) -> None:
+        """Release a specific Agent back to the native Windows taskbar, or reclaim it into the dock."""
+        target = None
+        for a in self.config.get("agents", []):
+            if a.get("id") == agent_id:
+                target = a
+                break
+        if target is None:
+            return
+
+        new_hide = not released
+        if (target.get("hide_from_taskbar", True) is not False) == new_hide:
+            return
+
+        target["hide_from_taskbar"] = new_hide
+        save_config(self.config)
+
+        if released:
+            for w in self._agent_windows.get(agent_id, []):
+                self._taskbar_hider.show_window(w["hwnd"])
+        self._refresh_state()
+
+    def _reclaim_all_released(self) -> None:
+        changed = False
+        for a in self.config.get("agents", []):
+            if a.get("hide_from_taskbar", True) is False:
+                a["hide_from_taskbar"] = True
+                changed = True
+        if not changed:
+            return
+        save_config(self.config)
+        self._refresh_state()
 
     def _toggle_focus_existing(self, checked: bool) -> None:
         self.config["ui"]["focus_existing"] = bool(checked)
