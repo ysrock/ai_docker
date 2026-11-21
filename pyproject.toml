@@ -1,0 +1,10 @@
+[project]
+name = "ai-doker"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "pillow>=13.0.0",
+    "pyside6>=6.12.0",
+    "pywin32>=312",
+]
