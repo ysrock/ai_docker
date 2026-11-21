@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 
 from .discovery import build_agent_from_file, discover_new_agents, slugify_id
 from .icons import WebIconLoader, load_agent_icon
+from .updater import UpdateCheckResult
 
 
 def dialog_stylesheet(theme: str = "dark") -> str:
@@ -413,3 +414,66 @@ class DiscoverAgentsDialog(QDialog):
                 chosen.append(item.data(Qt.UserRole))
         self.selected_agents = chosen
         self.accept()
+
+
+class UpdateDialog(QDialog):
+    """Apple-styled dialog presenting available updates and triggering 1-click update + restart."""
+
+    def __init__(
+        self,
+        result: UpdateCheckResult,
+        theme: str = "dark",
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("AI docker 检查更新")
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        self.setMinimumSize(460, 320)
+        self.setStyleSheet(dialog_stylesheet(theme))
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(10)
+
+        header = QLabel(f"发现 {result.behind_count} 个新更新")
+        header.setStyleSheet("font-size: 15px; font-weight: 700;")
+        sub = QLabel(
+            f"当前分支 {result.branch} ({result.local_sha})  ->  最新 ({result.remote_sha})"
+        )
+        sub.setObjectName("subLabel")
+        root.addWidget(header)
+        root.addWidget(sub)
+
+        commit_list = QListWidget()
+        commit_list.setSelectionMode(QListWidget.NoSelection)
+        for line in result.commits or (result.message,):
+            commit_list.addItem(QListWidgetItem(line))
+        root.addWidget(commit_list, 1)
+
+        if result.has_local_changes:
+            warn = QLabel(
+                "检测到本地存在未提交的代码改动，为避免覆盖你的修改，请先提交或执行 git stash 后再更新。"
+            )
+            warn.setWordWrap(True)
+            warn.setStyleSheet("color: #ff453a; font-size: 11px;")
+            root.addWidget(warn)
+        else:
+            note = QLabel(
+                "更新会自动拉取代码、按需同步依赖并重启 AI docker，你的本地 agents.json 配置不会被覆盖。"
+            )
+            note.setObjectName("subLabel")
+            note.setWordWrap(True)
+            root.addWidget(note)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        later_btn = QPushButton("稍后再说")
+        later_btn.clicked.connect(self.reject)
+        btn_row.addWidget(later_btn)
+
+        update_btn = QPushButton("一键更新并重启")
+        update_btn.setObjectName("primaryBtn")
+        update_btn.setEnabled(not result.has_local_changes)
+        update_btn.clicked.connect(self.accept)
+        btn_row.addWidget(update_btn)
+        root.addLayout(btn_row)

@@ -54,6 +54,19 @@ uv sync
 .\.venv\Scripts\python.exe main.py
 ```
 
+### 4. 一键更新到最新版本
+
+有两种方式可无痛更新（仅拉取程序代码，本地 `agents.json` 不会被覆盖）：
+
+- **图形界面一键更新**：在悬浮窗左侧拖动区（或收缩后的悬浮图标）右键 -> **配置与系统** -> **检查更新...**（程序启动后也会后台静默检查一次，有新版本时在菜单中提示）。点击 **“一键更新并重启”** 即可自动完成更新与重启。
+- **命令行一键更新**：
+
+```powershell
+.\update.ps1
+```
+
+脚本会自动优雅退出旧实例（还原任务栏图标）-> `git pull --ff-only` -> 依赖变动时自动 `uv sync` -> 启动器或图标变动时自动重编 `AI docker.exe` -> 重新启动 `AI docker`。
+
 ## 日常使用指南
 
 - **拖动整体位置**：按住左侧点阵手柄（或顶栏胶囊空白边缘）拖动，松手自动记录坐标（多屏环境下若断开副屏，启动时会自动复位到主屏安全区域）。
@@ -76,6 +89,7 @@ ai_docker/
 ├── main.py                       # 程序入口（单实例互斥锁 + 高分屏配置）
 ├── start_dock.pyw                # 无控制台 Python 入口
 ├── build_launcher.ps1            # 一键编译原生 AI docker.exe 并创建开始菜单快捷方式
+├── update.ps1                    # 一键优雅退出、快进拉取、同步依赖并重启脚本
 ├── launcher_src/
 │   └── AiDockerLauncher.cs        # WinExe 极简无黑框启动器源码
 ├── assets/
@@ -88,8 +102,9 @@ ai_docker/
 │   ├── launcher.py               # 窗口枚举、项目名解析、智能置顶与多类型启动
 │   ├── taskbar.py                # 基于 ITaskbarList 的任务栏隐藏与安全还原
 │   ├── notifications.py          # WPN 通知库 + Shell Hook + 标题未读聚合追踪
-│   ├── dialogs.py                # 扫描导入弹窗与手动添加弹窗
-│   ├── theme.py                  # macOS 深/浅色主题色板与毛玻璃表面绘制
+│   ├── dialogs.py                # 扫描导入、手动添加与检查更新弹窗
+│   ├── updater.py                # 后台 Git 更新检查与 update.ps1 分离拉起
+│   ├── theme.py                  # macOS 深/浅色主题色板、毛玻璃绘制与统一右键菜单
 │   └── dock_window.py            # 双层毛玻璃 HUD、60fps 波浪放大与交互控制
 └── docs/
     ├── ARCHITECTURE.md           # 模块架构与 Windows 底层机制说明

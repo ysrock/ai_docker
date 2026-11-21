@@ -76,6 +76,10 @@
 - **右键菜单 macOS 毛玻璃主题统一**：
   - 在 `ai_docker/theme.py` 新增 `AppleGlassMenu(QMenu)`，启用无边框透明窗口并直接复用 `paint_apple_glass` 绘制圆角毛玻璃面板与多层投影（彻底消除 Windows 原生 `QMenu` 的直角黑/灰底边），同步自绘抗锯齿苹果蓝勾选对勾、子菜单右箭头、发丝分隔线与退出项红色警示样式，所有嵌套子菜单自动继承深/浅双主题与透明度。
   - 重构全局右键菜单分组（`ai_docker/dock_window.py`）：一级菜单收拢为 3 项高频快捷操作 + 3 个分组子菜单（`Agent 管理` / `显示与行为` / `配置与系统`）+ 退出项，高度缩减超 50%；单 Agent 菜单的窗口切换文案优化为“切换到窗口：{项目名}”避免歧义。
+- **内置更新检查与一键更新重启**：
+  - 新增 `ai_docker/updater.py`（`check_for_updates`、`UpdateChecker`、`launch_updater_script`）与根目录 `update.ps1`：启动后延迟 6 秒在后台 `QThreadPool` 静默检查 `origin/<branch>` 是否有新提交，绝不阻塞主线程；有更新时在全局右键菜单“配置与系统”下提示新更新数量。
+  - 新增 `UpdateDialog`（`ai_docker/dialogs.py`）展示待拉取的提交日志并拦截未提交源码修改；用户点击“一键更新并重启”后拉起独立分离的 `update.ps1` 并优雅退出当前实例（先还原任务栏图标），随后快进拉取（`git pull --ff-only`，完整保留本地 `agents.json`）、按需 `uv sync` 与重编 `AI docker.exe` 并自动重启。
+  - 在 `tests/test_regressions.py` 新增真实本地裸仓库 + `update.ps1` 端到端回归用例与弹窗/菜单联动测试（累计 13 项测试全部通过）。
 
 ## 后续规划
 - 支持自定义全局快捷键呼出/切换悬浮窗。

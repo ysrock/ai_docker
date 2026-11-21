@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 from ai_docker.config import ConfigLoadError, load_config
 from ai_docker.notifications import NotificationTracker
+from ai_docker.updater import UpdateCheckResult, check_for_updates
 
 
 class NotificationTests(unittest.TestCase):
@@ -175,6 +176,79 @@ class ConfigTests(unittest.TestCase):
             loaded = load_config(good)
             self.assertEqual(loaded["ui"]["icon_size"], 32)
             self.assertEqual(loaded["agents"][0]["args"], ["--reuse-window"])
+
+
+class UpdaterTests(unittest.TestCase):
+    def test_check_for_updates_and_update_ps1_preserves_local_config(self):
+        import shutil
+        import subprocess
+
+        if not shutil.which("git"):
+            self.skipTest("git not available")
+
+        def run(cmd, cwd):
+            res = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, check=True)
+            return res.stdout.strip()
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(check_for_updates(root).status, "not_git")
+
+            bare = root / "origin.git"
+            bare.mkdir()
+            run(["git", "init", "--bare", "-b", "main"], bare)
+
+            upstream = root / "upstream"
+            run(["git", "clone", str(bare), str(upstream)], root)
+            run(["git", "config", "user.email", "test@example.com"], upstream)
+            run(["git", "config", "user.name", "Tester"], upstream)
+            (upstream / ".gitignore").write_text("agents.json\n", encoding="utf-8")
+            (upstream / "app.txt").write_text("v1\n", encoding="utf-8")
+            shutil.copy2(Path(__file__).resolve().parent.parent / "update.ps1", upstream / "update.ps1")
+            run(["git", "add", "."], upstream)
+            run(["git", "commit", "-m", "init v1"], upstream)
+            run(["git", "push", "-u", "origin", "main"], upstream)
+
+            clone = root / "user_clone"
+            run(["git", "clone", str(bare), str(clone)], root)
+            local_cfg = clone / "agents.json"
+            local_cfg.write_text('{"ui": {"theme": "light"}, "agents": []}', encoding="utf-8")
+
+            r0 = check_for_updates(clone)
+            self.assertEqual(r0.status, "up_to_date")
+            self.assertEqual(r0.behind_count, 0)
+            self.assertFalse(r0.has_local_changes)
+
+            # Push a new commit upstream
+            (upstream / "app.txt").write_text("v2\n", encoding="utf-8")
+            run(["git", "commit", "-am", "feat: upgrade to v2"], upstream)
+            run(["git", "push", "origin", "main"], upstream)
+
+            r1 = check_for_updates(clone)
+            self.assertEqual(r1.status, "update_available")
+            self.assertEqual(r1.behind_count, 1)
+            self.assertFalse(r1.has_local_changes)
+            self.assertTrue(any("feat: upgrade to v2" in c for c in r1.commits))
+
+            # Tracked local edit must be flagged
+            (clone / "app.txt").write_text("local edit\n", encoding="utf-8")
+            r_dirty = check_for_updates(clone)
+            self.assertTrue(r_dirty.has_local_changes)
+            run(["git", "checkout", "--", "app.txt"], clone)
+
+            # Execute real update.ps1 -NoLaunch on the cloned repo
+            if sys.platform == "win32":
+                shell = shutil.which("pwsh") or shutil.which("powershell") or "powershell.exe"
+                proc = subprocess.run(
+                    [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(clone / "update.ps1"), "-NoLaunch"],
+                    cwd=str(clone),
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(proc.returncode, 0, f"update.ps1 failed: {proc.stdout}\n{proc.stderr}")
+                self.assertEqual((clone / "app.txt").read_text(encoding="utf-8").strip(), "v2")
+                self.assertEqual(local_cfg.read_text(encoding="utf-8"), '{"ui": {"theme": "light"}, "agents": []}')
+                self.assertEqual(check_for_updates(clone).status, "up_to_date")
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows integration")
@@ -490,3 +564,62 @@ class WindowsTests(unittest.TestCase):
                 finally:
                     dock.close()
                     QThreadPool.globalInstance().waitForDone(3000)
+
+    def test_silent_update_check_updates_menu_and_dialog_guards_dirty_tree(self):
+        from PySide6.QtCore import QThreadPool
+        from PySide6.QtWidgets import QApplication, QPushButton
+
+        from ai_docker import dialogs, dock_window
+        from ai_docker.config import DEFAULT_UI
+
+        app = QApplication.instance() or QApplication(["regressions", "-platform", "offscreen"])
+        config = {
+            "ui": {**DEFAULT_UI, "hide_from_taskbar": False, "auto_collapse": False},
+            "agents": [{"id": "a1", "name": "Agent 1", "type": "exe", "path": "", "match_process": "a1.exe"}],
+        }
+        with (
+            patch.object(dock_window, "load_config", return_value=config),
+            patch.object(dock_window, "TaskbarHider"),
+            patch.object(dock_window, "NotificationTracker"),
+            patch.object(dock_window, "get_agent_window_map", return_value={}),
+        ):
+            dock = dock_window.AgentDockWindow()
+            dock._status_timer.stop()
+            dock._startup_update_timer.stop()
+            try:
+                fake = UpdateCheckResult(
+                    status="update_available",
+                    local_sha="1111111",
+                    remote_sha="2222222",
+                    branch="main",
+                    behind_count=2,
+                    commits=("2222222 feat: second", "1111112 fix: first"),
+                    has_local_changes=False,
+                    message="发现 2 个新提交",
+                )
+                dock._on_update_check_finished(fake, silent=True)
+                gmenu = dock._build_global_menu()
+                sys_act = next(a for a in gmenu.actions() if a.menu() is not None and "配置与系统" in a.text())
+                self.assertIn("有 2 个新更新", sys_act.text())
+                sys_items = [a.text() for a in sys_act.menu().actions() if not a.isSeparator()]
+                self.assertTrue(any("发现新更新（2 条）" in t for t in sys_items))
+                gmenu.deleteLater()
+
+                # Dirty tree disables primary update button in UpdateDialog
+                dirty_res = UpdateCheckResult(
+                    status="update_available",
+                    local_sha="1111111",
+                    remote_sha="2222222",
+                    branch="main",
+                    behind_count=1,
+                    commits=("2222222 feat: new",),
+                    has_local_changes=True,
+                )
+                dlg = dialogs.UpdateDialog(dirty_res, theme="light", parent=dock)
+                primary = dlg.findChild(QPushButton, "primaryBtn")
+                self.assertIsNotNone(primary)
+                self.assertFalse(primary.isEnabled())
+                dlg.deleteLater()
+            finally:
+                dock.close()
+                QThreadPool.globalInstance().waitForDone(3000)

@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 from .config import CONFIG_PATH, PROJECT_ROOT, ConfigLoadError, load_config, save_config
-from .dialogs import AddAgentDialog, DiscoverAgentsDialog
+from .dialogs import AddAgentDialog, DiscoverAgentsDialog, UpdateDialog
 from .discovery import build_agent_from_file
 from .icons import WebIconLoader, load_agent_icon
 from .launcher import (
@@ -57,6 +57,7 @@ from .notifications import (
 )
 from .taskbar import TaskbarHider
 from .theme import AppleGlassMenu, get_palette, paint_apple_glass
+from .updater import UpdateChecker, UpdateCheckResult, launch_updater_script
 
 user32 = ctypes.windll.user32
 user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
@@ -1095,6 +1096,9 @@ class AgentDockWindow(QWidget):
         self._icons: dict[str, QIcon] = {}
         self._web_icons = WebIconLoader(self)
         self._web_icons.ready.connect(self._on_web_icon_ready)
+        self._updater = UpdateChecker(self)
+        self._updater.finished.connect(self._on_update_check_finished)
+        self._available_update: UpdateCheckResult | None = None
         self._agent_windows: dict[str, list[dict[str, Any]]] = {}
         self._last_notif_map: dict[str, AgentNotificationSummary] = {}
         self._last_shelf_sig: tuple[Any, ...] | None = None
@@ -1172,6 +1176,13 @@ class AgentDockWindow(QWidget):
         self._status_timer.timeout.connect(self._refresh_state)
         self._status_timer.start()
         QTimer.singleShot(200, self._refresh_state)
+        self._startup_update_timer = QTimer(self)
+        self._startup_update_timer.setSingleShot(True)
+        self._startup_update_timer.setInterval(6000)
+        self._startup_update_timer.timeout.connect(
+            lambda: self._updater.check_async(silent=True)
+        )
+        self._startup_update_timer.start()
         if self._auto_collapse_enabled():
             self._schedule_auto_collapse()
 
@@ -1946,12 +1957,25 @@ class AgentDockWindow(QWidget):
         focus_action.setChecked(bool(self.config["ui"].get("focus_existing", True)))
         focus_action.triggered.connect(self._toggle_focus_existing)
 
-        system_menu = menu.addMenu("配置与系统")
+        sys_title = (
+            f"配置与系统（有 {self._available_update.behind_count} 个新更新）"
+            if self._available_update is not None
+            else "配置与系统"
+        )
+        system_menu = menu.addMenu(sys_title)
         reload_action = system_menu.addAction("重新加载配置与图标")
         reload_action.triggered.connect(self._reload_all)
 
         edit_action = system_menu.addAction("打开配置文件 (agents.json)")
         edit_action.triggered.connect(lambda: os.startfile(str(CONFIG_PATH)))
+
+        update_label = (
+            f"发现新更新（{self._available_update.behind_count} 条）..."
+            if self._available_update is not None
+            else "检查更新..."
+        )
+        update_action = system_menu.addAction(update_label)
+        update_action.triggered.connect(self._trigger_check_updates)
 
         system_menu.addSeparator()
 
@@ -2204,6 +2228,59 @@ class AgentDockWindow(QWidget):
         else:
             self._schedule_auto_collapse()
 
+    def _trigger_check_updates(self) -> None:
+        if self._available_update is not None:
+            self._open_update_dialog(self._available_update)
+            return
+        self._updater.check_async(silent=False)
+
+    def _on_update_check_finished(self, result: UpdateCheckResult, silent: bool) -> None:
+        if result.status == "update_available":
+            self._available_update = result
+            if not silent:
+                self._open_update_dialog(result)
+            return
+
+        if result.status == "up_to_date":
+            self._available_update = None
+
+        if silent:
+            return
+
+        self._dialog_open = True
+        self._cancel_auto_collapse()
+        try:
+            if result.status == "up_to_date":
+                QMessageBox.information(self, "AI docker 检查更新", result.message)
+            else:
+                QMessageBox.warning(self, "AI docker 检查更新", result.message)
+        finally:
+            self._dialog_open = False
+            self._schedule_auto_collapse()
+
+    def _open_update_dialog(self, result: UpdateCheckResult) -> None:
+        self._dialog_open = True
+        self._cancel_auto_collapse()
+        dlg: UpdateDialog | None = None
+        should_quit = False
+        try:
+            dlg = UpdateDialog(result, theme=self._theme(), parent=self)
+            if dlg.exec():
+                ok, detail = launch_updater_script(wait_pid=os.getpid(), gui_mode=True)
+                if ok:
+                    should_quit = True
+                else:
+                    QMessageBox.warning(self, "AI docker 更新失败", detail)
+        finally:
+            if dlg is not None:
+                dlg.deleteLater()
+            self._dialog_open = False
+            if not should_quit:
+                self._schedule_auto_collapse()
+
+        if should_quit:
+            self._quit_app()
+
     def _toggle_autostart(self, checked: bool) -> None:
         try:
             set_autostart(bool(checked))
@@ -2213,6 +2290,9 @@ class AgentDockWindow(QWidget):
     def _cleanup_resources(self) -> None:
         atexit.unregister(self._cleanup_resources)
         self._web_icons.invalidate()
+        self._updater.invalidate()
+        if hasattr(self, "_startup_update_timer"):
+            self._startup_update_timer.stop()
         if hasattr(self, "_collapse_timer"):
             self._collapse_timer.stop()
         if hasattr(self, "_status_timer"):
