@@ -72,6 +72,7 @@
   - `ai_docker/config.py` 收紧并补全 `ui` 与 `agents` 字段校验（排除 `bool` 绕过、收紧像素上限、补全 `args`/`command`/`cwd` 等校验）。
 - **交互边界与内存释放修复**：
   - `ai_docker/dock_window.py` 修复手动点击“立即收缩为悬浮图标”后因菜单关闭立即 `enterEvent` 弹回的问题（450ms 冷却，移出即复位）；修复靠右锚点启动或增删图标时展开态出屏问题；为扫描/添加弹窗补充 `deleteLater()` 与 `DiscoverAgentsDialog` 关闭时 `invalidate()`；统一封装 `_persist_config()` 容错处理文件占用异常。
+  - 修复关闭扫描/添加弹窗或 `QMessageBox` 导致 `AI docker` 整体退出的严重缺陷：`main.py` 改为 `app.setQuitOnLastWindowClosed(False)`（因 `AgentDockWindow` 使用 `Qt.Tool` 不计入 Qt 非工具窗口计数），并在 `AgentDockWindow.closeEvent()` 显式退出事件循环；通过弹窗新增 Agent 后若处于收缩态自动展开以即时展示新图标。
 
 ## 后续规划
 - 支持自定义全局快捷键呼出/切换悬浮窗。

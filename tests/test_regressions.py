@@ -379,3 +379,67 @@ class WindowsTests(unittest.TestCase):
             finally:
                 dock.close()
                 QThreadPool.globalInstance().waitForDone(3000)
+
+    def test_closing_discover_dialog_keeps_tool_dock_alive_and_expands(self):
+        from PySide6.QtCore import QThreadPool, QTimer
+        from PySide6.QtWidgets import QApplication
+
+        from ai_docker import dialogs, dock_window
+        from ai_docker.config import DEFAULT_UI
+
+        app = QApplication.instance() or QApplication(["regressions", "-platform", "offscreen"])
+        prev_quit_setting = app.quitOnLastWindowClosed()
+        app.setQuitOnLastWindowClosed(False)
+        discovered = [
+            {
+                "id": "visual-studio-code",
+                "name": "Visual Studio Code",
+                "type": "exe",
+                "path": r"C:\Apps\Code.exe",
+                "match_process": "Code.exe",
+                "enabled": True,
+            }
+        ]
+        config = {
+            "ui": {**DEFAULT_UI, "hide_from_taskbar": False, "auto_collapse": True},
+            "agents": [{"id": "base", "name": "Base", "type": "exe", "path": "", "match_process": "base.exe"}],
+        }
+
+        with (
+            patch.object(dock_window, "load_config", return_value=config),
+            patch.object(dock_window, "save_config"),
+            patch.object(dock_window, "TaskbarHider"),
+            patch.object(dock_window, "NotificationTracker"),
+            patch.object(dock_window, "get_agent_window_map", return_value={}),
+            patch.object(dialogs, "discover_new_agents", return_value=discovered),
+        ):
+            dock = dock_window.AgentDockWindow()
+            dock._taskbar_hider.hidden_count = 0
+            dock._notif_tracker.poll.return_value = {}
+            dock._status_timer.stop()
+            dock._collapse_timer.stop()
+            dock.show()
+            dock._collapse_dock(force=True)
+
+            def open_and_accept():
+                def accept_active():
+                    for w in app.topLevelWidgets():
+                        if isinstance(w, dialogs.DiscoverAgentsDialog) and w.isVisible():
+                            w._on_confirm()
+                            return
+
+                QTimer.singleShot(40, accept_active)
+                dock._open_discover_dialog()
+                # If closing the modal dialog accidentally triggered QApplication.quit(), exit(42) will never run
+                QTimer.singleShot(80, lambda: app.exit(42))
+
+            try:
+                QTimer.singleShot(20, open_and_accept)
+                rc = app.exec()
+                self.assertEqual(rc, 42, "Closing modal dialog must NOT quit the Qt.Tool dock app")
+                self.assertIn("visual-studio-code", dock._buttons)
+                self.assertFalse(dock._collapsed, "Adding an agent from dialog should expand the collapsed orb")
+            finally:
+                dock.close()
+                app.setQuitOnLastWindowClosed(prev_quit_setting)
+                QThreadPool.globalInstance().waitForDone(3000)

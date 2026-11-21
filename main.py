@@ -47,7 +47,10 @@ def main() -> int:
         ico_path = PROJECT_ROOT / "assets" / "ai_docker.ico"
         if ico_path.exists():
             app.setWindowIcon(QIcon(str(ico_path)))
-        app.setQuitOnLastWindowClosed(True)
+        # AgentDockWindow uses Qt.Tool (excluded from Qt's non-tool window count),
+        # so quitOnLastWindowClosed=True would exit the entire app whenever any
+        # QDialog or QMessageBox closes. AgentDockWindow.closeEvent/_quit_app handles exit.
+        app.setQuitOnLastWindowClosed(False)
 
         try:
             dock = AgentDockWindow()

@@ -2010,6 +2010,8 @@ class AgentDockWindow(QWidget):
             if dlg.exec() and dlg.selected_agents:
                 self.config["agents"].extend(dlg.selected_agents)
                 self._persist_config()
+                if self._collapsed:
+                    self._expand_dock()
                 top_left = self.pos()
                 self._rebuild_dock(force_refresh_icons=False)
                 self._reposition_after_rebuild(top_left)
@@ -2029,6 +2031,8 @@ class AgentDockWindow(QWidget):
             if dlg.exec() and dlg.created_agent:
                 self.config["agents"].append(dlg.created_agent)
                 self._persist_config()
+                if self._collapsed:
+                    self._expand_dock()
                 top_left = self.pos()
                 self._rebuild_dock(force_refresh_icons=False)
                 self._reposition_after_rebuild(top_left)
@@ -2240,6 +2244,9 @@ class AgentDockWindow(QWidget):
     def closeEvent(self, event) -> None:
         self._cleanup_resources()
         super().closeEvent(event)
+        app = QApplication.instance()
+        if app is not None and not app.quitOnLastWindowClosed():
+            app.quit()
 
     # --- Window dragging (left grip, empty capsule area & collapsed orb) ---
     def mousePressEvent(self, event) -> None:
