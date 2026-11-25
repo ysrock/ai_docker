@@ -11,7 +11,7 @@
 - **自动探测与多种零门槛添加方式**
   - 首次运行且本地尚无 `agents.json` 时，自动扫描本机已安装的常见 AI 工具并生成配置。
   - 支持右键 **“扫描本机新安装的 Agent...”** 一键增量发现桌面快捷方式、常见安装目录、MSIX 注册表与 `PATH` 命令行工具。
-  - 支持将任意 `.exe` / `.lnk` 直接拖拽到悬浮窗上松手入库，或通过右键 **“添加新 Agent...”** 弹窗添加桌面程序、网页 URL 或 CLI 命令。
+  - 支持将任意 `.exe` / `.lnk` / `.url` 甚至浏览器地址栏链接直接拖拽到悬浮窗上添加，或通过右键 **Agent 管理 -> 添加网页 Agent (URL)...** / **添加桌面 / CLI Agent...** 弹窗添加（自动读取剪贴板网址并适配 Chrome / Edge 独立应用窗口）。
 - **原生任务栏自动隐藏与安全还原**
   - 通过 Windows 官方 Shell COM 接口 `ITaskbarList`（`DeleteTab` / `AddTab`）自动隐藏已收纳 Agent 的运行中任务栏图标，无需替换 `explorer.exe`，无需管理员权限。
   - 取消勾选开关、隐藏某个 Agent 图标或退出程序时（通过 Qt 退出信号与 `atexit` 多重保障），自动将所有隐藏窗口还原回 Windows 任务栏。
@@ -59,6 +59,7 @@ uv sync
 有两种方式可无痛更新（仅拉取程序代码，本地 `agents.json` 不会被覆盖）：
 
 - **图形界面一键更新**：在悬浮窗左侧拖动区（或收缩后的悬浮图标）右键 -> **配置与系统** -> **检查更新...**（程序启动后也会后台静默检查一次，有新版本时在菜单中提示）。点击 **“一键更新并重启”** 即可自动完成更新与重启。
+- 如果确认时本地分支或远端提交已变化，更新器会要求重新检查并确认版本。
 - **命令行一键更新**：
 
 ```powershell
@@ -69,18 +70,56 @@ uv sync
 
 ## 日常使用指南
 
-- **拖动整体位置**：按住左侧点阵手柄（或顶栏胶囊空白边缘）拖动，松手自动记录坐标（多屏环境下若断开副屏，启动时会自动复位到主屏安全区域）。
-- **调整图标顺序**：直接按住第一行任意 Agent 图标左右拖动（目标位置会亮起蓝色竖线指示器），松手自动保存新顺序并同步更新下方项目卡片顺序；也可右键该图标在 **“调整位置”** 子菜单中选择向左移、向右移、移到最左或移到最右。
+- **拖动整体位置与双击收缩**：按住点阵手柄（或顶栏/侧栏空白边缘）拖动，松手自动记录坐标（多屏环境下若断开副屏，启动时会自动复位到主屏安全区域）；**双击**点阵手柄可立即收缩为单个悬浮图标。
+- **横向 / 纵向双布局与靠右镜像**：支持在全局右键 **显示与行为 -> 布局方向** 中切换横向（顶栏图标 + 下方卡片）或纵向（侧边图标 + 同行横向窗口条，多窗口自动折行并与图标严格对齐，停靠屏幕右半边时自动镜像为图标在右、窗口向左铺开）。
+- **调整图标顺序**：直接按住任意 Agent 图标拖动（目标位置会亮起蓝色指示线），松手自动保存新顺序并同步更新窗口列表顺序；也可右键该图标在 **“调整位置”** 子菜单中按当前布局方向逐步调整或置首/置尾。
 - **窗口切换与新开实例**：
-  - 点击下方项目卡片：直达该具体项目窗口并消除其通知角标。
-  - **单击**第一行图标：未运行时启动；单窗口时直接置顶唤醒；多窗口时连续点击在多个窗口间轮流切换。
-  - **双击**第一行图标：直接新开一个对应 Agent 实例（Cursor / Antigravity IDE / Windsurf / Trae 等编辑器自动带 `--new-window`，网页应用自动带 `--new-window --app=...`，CLI 工具自动新开 Windows Terminal 窗口）。
-- **拖拽添加**：直接从桌面或资源管理器把 `.exe` / `.lnk` 拖到第一行图标栏上松手即可收录。
+  - 点击项目窗口行：直达该具体项目窗口并消除其通知角标。
+  - **单击** Agent 图标：未运行时启动；单窗口时直接置顶唤醒；多窗口时若存在未读提醒则**优先跳转到最新有提醒的窗口**，顺延消标后恢复多窗口轮流切换。
+  - **双击** Agent 图标：直接新开一个对应 Agent 实例（Cursor / Antigravity IDE / Windsurf / Trae 等编辑器自动带 `--new-window`，网页应用自动带 `--new-window --app=...`，CLI 工具自动新开 Windows Terminal 窗口）。
+- **拖拽添加**：直接从桌面或资源管理器把 `.exe` / `.lnk` / `.url` 拖到悬浮窗上，或直接将浏览器地址栏链接拖到悬浮窗上松手即可收录。
 - **分区右键菜单（清爽不拥挤）**：
-  - **在左侧拖动区（点阵手柄、顶栏空白边缘或收缩后的悬浮图标）右键**：显示分组精简后的 `AI docker` 全局菜单（快捷操作：立即收缩/展开、切换深/浅色外观、清除全部通知角标；分组子菜单：**Agent 管理**、**显示与行为**、**配置与系统**；底部退出）。
-  - **在顶部 Agent 图标上右键**：仅显示针对该 Agent 的专属菜单（切换到已开窗口、新开实例、释放到系统任务栏 / 重新收进悬浮窗、有通知时清除角标、调整位置、隐藏该图标）。
-  - **在下方具体项目行上右键**：仅显示针对该窗口的精简菜单（切换到该窗口、有通知时清除该窗口角标、新开实例、释放/收回任务栏）。
+  - **在拖动区（点阵手柄、胶囊空白边缘或收缩后的悬浮图标）右键**：显示分组精简后的 `AI docker` 全局菜单（快捷操作：立即收缩/展开、切换深/浅色外观、清除全部通知角标；分组子菜单：**Agent 管理**、**显示与行为**、**配置与系统**；底部退出）。
+  - **在 Agent 图标上右键**：仅显示针对该 Agent 的专属菜单（切换到已开窗口、新开实例、释放到系统任务栏 / 重新收进悬浮窗、有通知时清除角标、调整位置、隐藏该图标）。
+  - **在具体项目窗口行上右键**：仅显示针对该窗口的精简菜单（切换到该窗口、有通知时清除该窗口角标、**关闭该窗口**（异步 `WM_CLOSE` 安全关闭）、新开实例、释放/收回任务栏）。
   - 状态视觉区分：收进悬浮窗的运行中 Agent 图标底部为实心 4px 圆点；已释放到 Windows 任务栏的运行中 Agent 底部为空心圆环。
+
+## CLI 接口（面向自动化与 AI Agent）
+
+项目内置零 GUI 依赖的命令行接口，方便 AI Agent 或脚本直接查询、增删、排序、切主题、拉起窗口并实时热通知正在运行的悬浮窗重载。所有命令均支持 `--json`（可放在子命令前或后）与 `--config <path>`：
+
+```powershell
+# 查看完整命令与配置 Schema（便于 AI 自发现）
+.\ai-docker.cmd schema --json
+
+# 查看当前悬浮窗状态、运行中 Agent 与已打开项目窗口
+.\ai-docker.cmd status --json
+.\ai-docker.cmd list --all --json
+
+# 添加网页 / 桌面 / CLI / MSIX Agent（写入后自动热重载运行中的悬浮窗）
+.\ai-docker.cmd add web "https://chat.deepseek.com" --name "DeepSeek" --json
+.\ai-docker.cmd add exe "C:\Path\To\App.exe" --json
+.\ai-docker.cmd add cli "codex" --name "Codex CLI" --json
+
+# 显示/隐藏、排序、释放/收回任务栏、唤醒或新开实例
+.\ai-docker.cmd move cursor first --json
+.\ai-docker.cmd hide grok-bot --json
+.\ai-docker.cmd release cursor --json
+.\ai-docker.cmd reclaim --all --json
+.\ai-docker.cmd open cursor --new --json
+
+# 扫描本机新装 Agent / 修改 UI 配置 / 远程控制悬浮窗
+.\ai-docker.cmd discover --apply --json
+.\ai-docker.cmd config set theme dark --json
+.\ai-docker.cmd config set orientation vertical --json
+.\ai-docker.cmd config set auto_collapse_seconds 10 --json
+.\ai-docker.cmd dock reload --json
+.\ai-docker.cmd dock collapse --json
+.\ai-docker.cmd dock expand --json
+.\ai-docker.cmd update check --json
+```
+
+也可以通过 `.\.venv\Scripts\python.exe -m ai_docker ...` 直接调用。
 
 ## 项目目录结构
 
@@ -88,6 +127,7 @@ uv sync
 ai_docker/
 ├── main.py                       # 程序入口（单实例互斥锁 + 高分屏配置）
 ├── start_dock.pyw                # 无控制台 Python 入口
+├── ai-docker.cmd                 # Windows 命令行快捷入口（转发至 python -m ai_docker）
 ├── build_launcher.ps1            # 一键编译原生 AI docker.exe 并创建开始菜单快捷方式
 ├── update.ps1                    # 一键优雅退出、快进拉取、同步依赖并重启脚本
 ├── launcher_src/
@@ -96,7 +136,11 @@ ai_docker/
 │   ├── ai_docker.ico              # 多分辨率应用图标
 │   └── ai_docker.png              # 应用图标预览图
 ├── ai_docker/
-│   ├── config.py                 # 配置读写与首启自动探测初始化
+│   ├── __main__.py               # python -m ai_docker CLI 入口
+│   ├── cli.py                    # 面向 AI 与自动化的全功能 JSON/文本 CLI
+│   ├── ipc.py                    # 基于 Win32 自定义消息的悬浮窗热重载与远程控制
+│   ├── web_utils.py              # URL 校验、智能命名、.url 解析与浏览器匹配
+│   ├── config.py                 # 配置校验、原子读写与首启自动探测初始化
 │   ├── discovery.py              # 本机 AI Agent 自动扫描与 .lnk/.exe 解析
 │   ├── icons.py                  # 高清真实图标提取、主题反色适配与本地缓存
 │   ├── launcher.py               # 窗口枚举、项目名解析、智能置顶与多类型启动

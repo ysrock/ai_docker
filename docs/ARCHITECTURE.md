@@ -7,16 +7,19 @@
 | 模块 | 职责 |
 | --- | --- |
 | `main.py` | 单实例 Win32 互斥锁（`Local\AI_docker_FloatingDock_Mutex`）、高分屏缩放策略初始化、应用图标设置 |
-| `ai_docker/config.py` | 读写本地 `agents.json`；当配置文件不存在时自动触发 `discover_new_agents([])` 完成首启初始化 |
+| `ai_docker/cli.py` | 零 GUI 依赖的 CLI 接口（支持 `--json` 结构化输出、`schema` 自发现、Agent 增删改查、配置管理、扫描与悬浮窗远程控制） |
+| `ai_docker/ipc.py` | 基于 Win32 窗口属性与 `RegisterWindowMessageW` 的进程间控制（热重载、展开、收缩、清角标、优雅关闭） |
+| `ai_docker/web_utils.py` | 纯 Python URL 校验、智能默认命名、`.url` 快捷方式解析与浏览器进程匹配 |
+| `ai_docker/config.py` | 读写与校验本地 `agents.json`；当配置文件不存在时自动触发 `discover_new_agents([])` 完成首启初始化 |
 | `ai_docker/discovery.py` | 快速扫描桌面/开始菜单快捷方式、常见程序目录（浅层）、AppModel 注册表 MSIX 家族和 `PATH` 命令行，以及拖入 `.exe`/`.lnk` 解析 |
 | `ai_docker/icons.py` | Win32 `PrivateExtractIconsW` RGBA 提取（带 legacy mask 兜底）、MSIX AppModel 动态目录 Logo 定位与深浅主题反色选择、后台下载网页图标与原子更新 PNG 缓存、圆角裁剪与 CLI `>_` 角标合成 |
-| `ai_docker/launcher.py` | 顶层可见窗口枚举（过滤 `WS_EX_TOOLWINDOW` 与 DWM Cloaked 窗口）、`QueryFullProcessImageNameW` 进程路径解析、项目名提取、多窗口轮切与前台锁兜底唤醒、多类型进程启动与开机自启快捷方式管理 |
+| `ai_docker/launcher.py` | 顶层可见窗口枚举（过滤 `WS_EX_TOOLWINDOW` 与 DWM Cloaked 窗口）、`QueryFullProcessImageNameW` 进程路径解析、项目名提取、多窗口提醒优先跳转与轮切、前台锁兜底唤醒、异步 `WM_CLOSE` 关闭窗口、多类型进程启动与开机自启快捷方式管理 |
 | `ai_docker/taskbar.py` | 通过 `pywin32` 原生 `ITaskbarList` COM 接口管理运行中窗口的任务栏隐藏（`DeleteTab`）与还原（`AddTab`），内置 `Shell_TrayWnd` 句柄变化检测以兼容 `explorer.exe` 重启 |
-| `ai_docker/notifications.py` | 聚合 Windows 本地通知库 `wpndatabase.db` 水位线增量 Toast/Badge、Windows Shell Hook `HSHELL_FLASH` 闪烁事件与窗口标题未读数字，并按项目名归属到具体窗口 |
+| `ai_docker/notifications.py` | 聚合 Windows 本地通知库 `wpndatabase.db` 水位线增量 Toast/Badge、Windows Shell Hook `HSHELL_FLASH` 闪烁事件与窗口标题未读数字，按项目名归属到具体窗口并维护窗口级最近提醒排序 |
 | `ai_docker/dialogs.py` | 适配深/浅双主题的本机扫描导入弹窗（`DiscoverAgentsDialog`）、手动添加弹窗（`AddAgentDialog`）与更新提示弹窗（`UpdateDialog`） |
 | `ai_docker/updater.py` | 基于 `QThreadPool` 的非阻塞 Git 远端更新检查（`UpdateChecker`）与分离式 `update.ps1` 更新拉起 |
 | `ai_docker/theme.py` | macOS 深色磨砂 / 浅色毛玻璃色板、`paint_apple_glass` 绘制与统一风格 `AppleGlassMenu` |
-| `ai_docker/dock_window.py` | 双层毛玻璃 HUD 主窗口（`TopDockCapsule` + `AgentWorkspaceCard`）、60fps 余弦波浪放大动画、文件拖放接收、分区右键菜单与全局状态轮询 |
+| `ai_docker/dock_window.py` | 支持横向与纵向双布局的悬浮玻璃主窗口（`TopDockCapsule` + `AgentWorkspaceCard` / `AgentHorizontalStrip`）、靠右自动镜像、60fps 余弦波浪放大动画、文件拖放接收、分区右键菜单（含单窗口关闭）与全局状态轮询 |
 
 ## 2. 关键 Windows 底层机制
 

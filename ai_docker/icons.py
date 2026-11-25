@@ -10,6 +10,7 @@ import urllib.request
 from collections.abc import Callable
 from ctypes import wintypes
 from pathlib import Path
+from threading import Event
 from typing import Any
 from urllib.parse import urlparse
 
@@ -342,7 +343,7 @@ def find_msix_icon(aumid: str, theme: str = "dark") -> Path | None:
     return None
 
 
-def fetch_web_icon_to_png(url: str, force: bool = False) -> Path | None:
+def fetch_web_icon_to_png(url: str, force: bool = False, *, cancelled: Event | None = None) -> Path | None:
     try:
         parsed = urlparse(url)
         if not parsed.scheme:
@@ -377,16 +378,20 @@ def fetch_web_icon_to_png(url: str, force: bool = False) -> Path | None:
         )
     }
     for cand in candidates:
+        if cancelled is not None and cancelled.is_set():
+            return None
         try:
             req = urllib.request.Request(cand, headers=headers)
             deadline = time.monotonic() + 2.0
             with urllib.request.urlopen(req, timeout=2.0) as resp:
                 data = bytearray()
                 while chunk := resp.read1(65536):
+                    if cancelled is not None and cancelled.is_set():
+                        return None
                     data.extend(chunk)
                     if len(data) > 2 * 1024 * 1024 or time.monotonic() >= deadline:
                         raise ValueError("Icon download exceeded its limit")
-            if not data:
+            if not data or (cancelled is not None and cancelled.is_set()):
                 continue
             with Image.open(io.BytesIO(data)) as img:
                 rgba = img.convert("RGBA")
@@ -408,18 +413,23 @@ def fetch_web_icon_to_png(url: str, force: bool = False) -> Path | None:
 
 
 class _WebIconRequest(QRunnable):
-    def __init__(self, url: str, force: bool, generation: int, complete: Callable[..., None]) -> None:
+    def __init__(
+        self, url: str, force: bool, generation: int, cancelled: Event, complete: Callable[..., None]
+    ) -> None:
         super().__init__()
         self.url = url
         self.force = force
         self.generation = generation
+        self.cancelled = cancelled
         self.complete = complete
 
     def run(self) -> None:
+        path = None
         try:
-            path = fetch_web_icon_to_png(self.url, self.force)
+            if not self.cancelled.is_set():
+                path = fetch_web_icon_to_png(self.url, self.force, cancelled=self.cancelled)
         except Exception:
-            path = None
+            pass
         try:
             self.complete(self.generation, self.url, path)
         except RuntimeError:
@@ -436,12 +446,15 @@ class WebIconLoader(QObject):
     def __init__(self, parent: QObject) -> None:
         super().__init__(parent)
         self._generation = 0
+        self._cancelled = Event()
         self._paths: dict[str, Path | None] = {}
         self._in_flight: set[str] = set()
         self._deferred: dict[str, bool] = {}
         self._downloaded.connect(self._store_path, Qt.ConnectionType.QueuedConnection)
 
     def invalidate(self) -> None:
+        self._cancelled.set()
+        self._cancelled = Event()
         self._generation += 1
         self._paths.clear()
         self._deferred.clear()
@@ -457,7 +470,7 @@ class WebIconLoader(QObject):
 
     def _start(self, url: str, force: bool) -> None:
         self._in_flight.add(url)
-        request = _WebIconRequest(url, force, self._generation, self._downloaded.emit)
+        request = _WebIconRequest(url, force, self._generation, self._cancelled, self._downloaded.emit)
         QThreadPool.globalInstance().start(request)
 
     @Slot(int, str, object)

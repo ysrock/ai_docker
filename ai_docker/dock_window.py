@@ -31,6 +31,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QBoxLayout,
+    QGridLayout,
     QHBoxLayout,
     QMenu,
     QMessageBox,
@@ -39,16 +41,32 @@ from PySide6.QtWidgets import (
 )
 
 from .config import CONFIG_PATH, PROJECT_ROOT, ConfigLoadError, load_config, save_config
-from .dialogs import AddAgentDialog, DiscoverAgentsDialog, UpdateDialog
+from .dialogs import (
+    AddAgentDialog,
+    DiscoverAgentsDialog,
+    UpdateDialog,
+    normalize_web_url,
+    read_internet_shortcut_url,
+)
 from .discovery import build_agent_from_file
 from .icons import WebIconLoader, load_agent_icon
 from .launcher import (
+    close_hwnd,
     focus_hwnd,
     get_agent_window_map,
     get_foreground_hwnd,
+    get_last_focused_hwnd,
     is_autostart_enabled,
     launch_agent,
     set_autostart,
+)
+from .ipc import (
+    INSTALL_PROPERTY as _INSTALL_PROPERTY,
+    IPC_CMD_CLEAR_NOTIFICATIONS,
+    IPC_CMD_COLLAPSE,
+    IPC_CMD_EXPAND,
+    IPC_CMD_RELOAD,
+    IPC_CONTROL_MESSAGE_NAME,
 )
 from .notifications import (
     AgentNotificationSummary,
@@ -66,6 +84,10 @@ user32.RegisterShellHookWindow.argtypes = [wintypes.HWND]
 user32.RegisterShellHookWindow.restype = wintypes.BOOL
 user32.DeregisterShellHookWindow.argtypes = [wintypes.HWND]
 user32.DeregisterShellHookWindow.restype = wintypes.BOOL
+user32.SetPropW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.HANDLE]
+user32.SetPropW.restype = wintypes.BOOL
+user32.RemovePropW.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
+user32.RemovePropW.restype = wintypes.HANDLE
 
 HSHELL_WINDOWACTIVATED = 4
 HSHELL_RUDEAPPACTIVATED = 0x8004
@@ -80,15 +102,37 @@ TYPE_LABELS = {
 
 
 class DragGrip(QWidget):
-    """Dedicated Apple-minimal drag handle at the left edge of Row 1 to move the whole dock."""
+    """Dedicated Apple-minimal drag handle at the edge of the dock capsule to move the whole dock."""
 
-    def __init__(self, height: int = 46, theme: str = "dark", parent: QWidget | None = None):
+    double_clicked = Signal()
+
+    def __init__(
+        self,
+        height: int = 46,
+        theme: str = "dark",
+        orientation: str = "horizontal",
+        parent: QWidget | None = None,
+    ):
         super().__init__(parent)
         self._theme = theme
+        self._orientation = "vertical" if orientation == "vertical" else "horizontal"
+        self._size = height
         self._hovered = False
         self.setCursor(Qt.SizeAllCursor)
-        self.setToolTip("左键拖动悬浮窗位置 · 右键打开全局菜单")
-        self.setFixedSize(16, height)
+        self.setToolTip("左键拖动悬浮窗位置 · 双击收缩为悬浮图标 · 右键打开全局菜单")
+        self._apply_size()
+
+    def _apply_size(self) -> None:
+        if self._orientation == "vertical":
+            self.setFixedSize(self._size, 16)
+        else:
+            self.setFixedSize(16, self._size)
+
+    def set_orientation(self, orientation: str, size: int) -> None:
+        self._orientation = "vertical" if orientation == "vertical" else "horizontal"
+        self._size = size
+        self._apply_size()
+        self.update()
 
     def set_theme(self, theme: str) -> None:
         self._theme = theme
@@ -104,13 +148,25 @@ class DragGrip(QWidget):
         self.update()
         super().leaveEvent(event)
 
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self.double_clicked.emit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
         pal = get_palette(self._theme)
+        is_vert = self._orientation == "vertical"
 
         if self._hovered:
-            bg = QRectF(1.0, 6.0, self.width() - 2.0, self.height() - 12.0)
+            bg = (
+                QRectF(6.0, 1.0, self.width() - 12.0, self.height() - 2.0)
+                if is_vert
+                else QRectF(1.0, 6.0, self.width() - 2.0, self.height() - 12.0)
+            )
             path = QPainterPath()
             path.addRoundedRect(bg, 6.0, 6.0)
             painter.fillPath(path, pal["icon_hover_bg"])
@@ -120,9 +176,14 @@ class DragGrip(QWidget):
         painter.setPen(Qt.NoPen)
 
         r = 1.35
-        xs = [5.5, 10.5]
-        mid_y = self.height() / 2.0
-        ys = [mid_y - 7.5, mid_y - 2.5, mid_y + 2.5, mid_y + 7.5]
+        if is_vert:
+            mid_x = self.width() / 2.0
+            xs = [mid_x - 7.5, mid_x - 2.5, mid_x + 2.5, mid_x + 7.5]
+            ys = [5.5, 10.5]
+        else:
+            xs = [5.5, 10.5]
+            mid_y = self.height() / 2.0
+            ys = [mid_y - 7.5, mid_y - 2.5, mid_y + 2.5, mid_y + 7.5]
         for x in xs:
             for y in ys:
                 painter.drawEllipse(QRectF(x - r, y - r, r * 2, r * 2))
@@ -143,6 +204,7 @@ class AgentIconButton(QWidget):
         button_size: int = 46,
         icon_size: int = 32,
         theme: str = "dark",
+        orientation: str = "horizontal",
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
@@ -151,6 +213,7 @@ class AgentIconButton(QWidget):
         self._button_size = button_size
         self._icon_size = icon_size
         self._theme = theme
+        self._orientation = "vertical" if orientation == "vertical" else "horizontal"
         self._hovered = False
         self._pressed = False
         self._window_count = 0
@@ -173,11 +236,22 @@ class AgentIconButton(QWidget):
         self._scale = 1.0
         self._target_scale = 1.0
 
-        # Extra vertical headroom so magnified icons float smoothly without clipping
-        self.setFixedSize(button_size, button_size + 6)
+        # Extra headroom on the perpendicular axis so magnified icons float cleanly without clipping
+        if self._orientation == "vertical":
+            self.setFixedSize(button_size + 6, button_size)
+        else:
+            self.setFixedSize(button_size, button_size + 6)
         self.setCursor(Qt.PointingHandCursor)
         self.setMouseTracking(True)
         self._refresh_tooltip()
+
+    def _find_capsule(self) -> TopDockCapsule | None:
+        w = self.parentWidget()
+        while w is not None:
+            if isinstance(w, TopDockCapsule):
+                return w
+            w = w.parentWidget()
+        return None
 
     def set_theme(self, theme: str) -> None:
         self._theme = theme
@@ -276,7 +350,7 @@ class AgentIconButton(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
-        parent_bar = self.parentWidget()
+        capsule = self._find_capsule()
         cur_global = event.globalPosition().toPoint()
 
         if self._press_global is not None and (event.buttons() & Qt.LeftButton):
@@ -286,19 +360,19 @@ class AgentIconButton(QWidget):
                 self._pressed = False
                 self.setCursor(Qt.ClosedHandCursor)
                 self.update()
-                if isinstance(parent_bar, TopDockCapsule):
-                    parent_bar.begin_reorder(self)
+                if capsule is not None:
+                    capsule.begin_reorder(self)
             if self._reordering:
-                if isinstance(parent_bar, TopDockCapsule):
-                    parent_bar.update_reorder(cur_global)
+                if capsule is not None:
+                    capsule.update_reorder(cur_global)
                 event.accept()
                 return
             event.accept()
             return
 
         # Normal hover: feed cursor position to parent TopDockCapsule for smooth wave magnification
-        if isinstance(parent_bar, TopDockCapsule):
-            parent_bar.update_wave_from_global(cur_global)
+        if capsule is not None:
+            capsule.update_wave_from_global(cur_global)
         super().mouseMoveEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:
@@ -331,9 +405,9 @@ class AgentIconButton(QWidget):
             self.setCursor(Qt.PointingHandCursor)
             self.update()
             if was_reordering:
-                parent_bar = self.parentWidget()
-                if isinstance(parent_bar, TopDockCapsule):
-                    parent_bar.finish_reorder()
+                capsule = self._find_capsule()
+                if capsule is not None:
+                    capsule.finish_reorder()
             elif self.rect().contains(event.position().toPoint()):
                 self._click_timer.start()
             event.accept()
@@ -345,9 +419,14 @@ class AgentIconButton(QWidget):
         painter.setRenderHint(QPainter.Antialiasing, True)
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         pal = get_palette(self._theme)
+        is_vert = self._orientation == "vertical"
+        bg_rect = (
+            QRectF(5.0, 2.0, self.width() - 10.0, self.height() - 4.0)
+            if is_vert
+            else QRectF(2.0, 5.0, self.width() - 4.0, self.height() - 10.0)
+        )
 
         if self._reordering:
-            bg_rect = QRectF(2.0, 5.0, self.width() - 4.0, self.height() - 10.0)
             path = QPainterPath()
             path.addRoundedRect(bg_rect, 11.0, 11.0)
             painter.fillPath(path, pal["icon_press_bg"])
@@ -356,29 +435,28 @@ class AgentIconButton(QWidget):
             painter.drawPath(path)
             painter.setOpacity(0.5)
         elif self._pressed or self._hovered:
-            bg_rect = QRectF(2.0, 5.0, self.width() - 4.0, self.height() - 10.0)
             path = QPainterPath()
             path.addRoundedRect(bg_rect, 11.0, 11.0)
             painter.fillPath(path, pal["icon_press_bg"] if self._pressed else pal["icon_hover_bg"])
 
         eff_scale = self._scale * (0.93 if self._pressed else 1.0)
         draw_size = min(float(self._button_size - 4), self._icon_size * eff_scale)
-        lift = (eff_scale - 1.0) * 14.0  # smooth Apple Dock upward float
+        lift = 0.0 if is_vert else (eff_scale - 1.0) * 14.0  # keep vertical slot icons vertically centered
 
         dpr = self.devicePixelRatioF()
         pm = self._icon.pixmap(QSize(int(math.ceil(draw_size * dpr)), int(math.ceil(draw_size * dpr))))
         if not pm.isNull():
             pm.setDevicePixelRatio(dpr)
             x = (self.width() - draw_size) / 2.0
-            base_y = (self.height() - draw_size) / 2.0 - 1.0
-            y = max(2.0, base_y - lift)
+            base_y = (self.height() - draw_size) / 2.0 - (1.5 if is_vert else 1.0)
+            y = max(1.0, base_y) if is_vert else max(2.0, base_y - lift)
             painter.drawPixmap(QRectF(x, y, draw_size, draw_size), pm, QRectF(pm.rect()))
 
         # Classic Apple macOS 4px circular running dot at bottom (hollow ring when released to taskbar)
         if self._window_count > 0 and self._show_running_dot:
             dot_d = 4.0
             dx = (self.width() - dot_d) / 2.0
-            dy = self.height() - 5.2
+            dy = self.height() - (4.5 if is_vert else 5.2)
             if self._released_to_taskbar:
                 painter.setBrush(Qt.NoBrush)
                 painter.setPen(QPen(pal["running_dot"], 1.25))
@@ -397,8 +475,8 @@ class AgentIconButton(QWidget):
                 badge_text = "9+" if self._notif_count > 9 else str(self._notif_count)
             bh = 15.0 if badge_text else 9.5
             bw = 19.5 if len(badge_text) > 1 else bh
-            bx = self.width() - bw - 1.0
-            by = max(1.0, 3.0 - lift * 0.5)
+            bx = self.width() - bw - (2.0 if is_vert else 1.0)
+            by = 2.0 if is_vert else max(1.0, 3.0 - lift * 0.5)
             badge_rect = QRectF(bx, by, bw, bh)
 
             painter.setBrush(pal["alert"])
@@ -415,37 +493,62 @@ class AgentIconButton(QWidget):
 
 
 class TopDockCapsule(QWidget):
-    """Row 1: evenly-spaced Apple glass Dock bar with 60fps wave magnification & drag reorder."""
+    """Main Apple glass Dock capsule (horizontal or vertical) with 60fps wave magnification & drag reorder."""
 
     reorder_requested = Signal(str, int)
 
-    def __init__(self, theme: str = "dark", alpha: int = 232, parent: QWidget | None = None):
+    def __init__(
+        self,
+        theme: str = "dark",
+        alpha: int = 232,
+        orientation: str = "horizontal",
+        parent: QWidget | None = None,
+    ):
         super().__init__(parent)
         self._theme = theme
         self._alpha = alpha
+        self._orientation = "vertical" if orientation == "vertical" else "horizontal"
         self._shadow_pad = 7
         self._drop_highlight = False
         self._icon_buttons: list[AgentIconButton] = []
+        self._slot_widgets: dict[str, QWidget] = {}
         self._reordering_btn: AgentIconButton | None = None
         self._insert_slot: int | None = None
 
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setMouseTracking(True)
 
-        self.row_layout = QHBoxLayout(self)
-        self.row_layout.setContentsMargins(
-            self._shadow_pad + 9,
-            self._shadow_pad + 3,
-            self._shadow_pad + 11,
-            self._shadow_pad + 3,
-        )
-        self.row_layout.setSpacing(6)
-        self.row_layout.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        self.row_layout = QBoxLayout(QBoxLayout.LeftToRight, self)
+        self._apply_orientation_layout()
 
         # 60fps animation timer (auto-stops when icons settle to 0% idle CPU)
         self._anim_timer = QTimer(self)
         self._anim_timer.setInterval(16)
         self._anim_timer.timeout.connect(self._tick_wave)
+
+    def _apply_orientation_layout(self) -> None:
+        pad = self._shadow_pad
+        if self._orientation == "vertical":
+            self.row_layout.setDirection(QBoxLayout.TopToBottom)
+            self.row_layout.setContentsMargins(pad + 3, pad + 9, pad + 3, pad + 11)
+            self.row_layout.setSpacing(4)
+            self.row_layout.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        else:
+            self.row_layout.setDirection(QBoxLayout.LeftToRight)
+            self.row_layout.setContentsMargins(pad + 9, pad + 3, pad + 11, pad + 3)
+            self.row_layout.setSpacing(6)
+            self.row_layout.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+
+    def set_orientation(self, orientation: str) -> None:
+        normalized = "vertical" if orientation == "vertical" else "horizontal"
+        if self._orientation != normalized:
+            self._orientation = normalized
+            self._apply_orientation_layout()
+            self.update()
+
+    def first_icon_top_offset(self, grip_height: int) -> int:
+        """Top Y coordinate of the first icon slot in vertical mode for zero-offset shelf alignment."""
+        return self._shadow_pad + 9 + grip_height + 4
 
     def set_theme_and_alpha(self, theme: str, alpha: int) -> None:
         self._theme = theme
@@ -462,6 +565,18 @@ class TopDockCapsule(QWidget):
         self._reordering_btn = None
         self._insert_slot = None
 
+    def set_slot_widgets(self, slots: dict[str, QWidget]) -> None:
+        self._slot_widgets = slots
+
+    def set_slot_heights(self, heights: dict[str, int], default_height: int) -> None:
+        """Keep each vertical icon slot aligned to the height of its horizontal window strip."""
+        for aid, slot in self._slot_widgets.items():
+            target_h = max(default_height, heights.get(aid, default_height))
+            if slot.height() != target_h or slot.minimumHeight() != target_h:
+                slot.setFixedHeight(target_h)
+        self.row_layout.invalidate()
+        self.adjustSize()
+
     def begin_reorder(self, btn: AgentIconButton) -> None:
         self._reordering_btn = btn
         self.reset_wave()
@@ -474,11 +589,14 @@ class TopDockCapsule(QWidget):
     def update_reorder(self, global_pos: QPoint) -> None:
         if self._reordering_btn is None or not self._icon_buttons:
             return
-        local_x = self.mapFromGlobal(global_pos).x()
+        is_vert = self._orientation == "vertical"
+        local_pt = self.mapFromGlobal(global_pos)
+        local_coord = local_pt.y() if is_vert else local_pt.x()
         slot = len(self._icon_buttons)
         for idx, btn in enumerate(self._icon_buttons):
-            center_x = btn.x() + btn.width() / 2.0
-            if local_x < center_x:
+            center = btn.mapTo(self, btn.rect().center())
+            btn_center = center.y() if is_vert else center.x()
+            if local_coord < btn_center:
                 slot = idx
                 break
         if slot != self._insert_slot:
@@ -505,11 +623,14 @@ class TopDockCapsule(QWidget):
     def update_wave_from_global(self, global_pos: QPoint) -> None:
         if self._reordering_btn is not None:
             return
-        local_x = self.mapFromGlobal(global_pos).x()
+        is_vert = self._orientation == "vertical"
+        local_pt = self.mapFromGlobal(global_pos)
+        local_coord = local_pt.y() if is_vert else local_pt.x()
         radius = 96.0
         for btn in self._icon_buttons:
-            center_x = btn.x() + btn.width() / 2.0
-            dist = abs(local_x - center_x)
+            center = btn.mapTo(self, btn.rect().center())
+            btn_center = center.y() if is_vert else center.x()
+            dist = abs(local_coord - btn_center)
             if dist < radius:
                 bell = 0.5 * (1.0 + math.cos(math.pi * dist / radius))
                 btn.set_target_scale(1.0 + 0.26 * bell)
@@ -544,17 +665,25 @@ class TopDockCapsule(QWidget):
             self.reset_wave()
         super().leaveEvent(event)
 
-    def _indicator_x_for_slot(self, slot: int) -> float | None:
+    def _indicator_pos_for_slot(self, slot: int) -> float | None:
         if not self._icon_buttons:
             return None
+        is_vert = self._orientation == "vertical"
         if slot <= 0:
-            return float(self._icon_buttons[0].x()) - 3.0
+            first_tl = self._icon_buttons[0].mapTo(self, QPoint(0, 0))
+            return float(first_tl.y() if is_vert else first_tl.x()) - 3.0
         if slot >= len(self._icon_buttons):
             last = self._icon_buttons[-1]
-            return float(last.x() + last.width()) + 3.0
+            last_tl = last.mapTo(self, QPoint(0, 0))
+            end_coord = (last_tl.y() + last.height()) if is_vert else (last_tl.x() + last.width())
+            return float(end_coord) + 3.0
         left_btn = self._icon_buttons[slot - 1]
         right_btn = self._icon_buttons[slot]
-        return (left_btn.x() + left_btn.width() + right_btn.x()) / 2.0
+        left_tl = left_btn.mapTo(self, QPoint(0, 0))
+        right_tl = right_btn.mapTo(self, QPoint(0, 0))
+        left_end = (left_tl.y() + left_btn.height()) if is_vert else (left_tl.x() + left_btn.width())
+        right_start = right_tl.y() if is_vert else right_tl.x()
+        return (left_end + right_start) / 2.0
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
@@ -572,17 +701,25 @@ class TopDockCapsule(QWidget):
 
         # Draw glowing Apple Blue insertion bar while dragging an icon to reorder
         if self._reordering_btn is not None and self._insert_slot is not None:
-            ix = self._indicator_x_for_slot(self._insert_slot)
-            if ix is not None:
+            pos = self._indicator_pos_for_slot(self._insert_slot)
+            if pos is not None:
                 pal = get_palette(self._theme)
-                bar_h = max(24.0, rect.height() - 16.0)
-                by = rect.top() + (rect.height() - bar_h) / 2.0
                 accent = pal["accent"]
                 painter.setPen(Qt.NoPen)
-                painter.setBrush(QColor(accent.red(), accent.green(), accent.blue(), 85))
-                painter.drawRoundedRect(QRectF(ix - 3.0, by - 1.0, 6.0, bar_h + 2.0), 3.0, 3.0)
-                painter.setBrush(accent)
-                painter.drawRoundedRect(QRectF(ix - 1.4, by, 2.8, bar_h), 1.4, 1.4)
+                if self._orientation == "vertical":
+                    bar_w = max(24.0, rect.width() - 16.0)
+                    bx = rect.left() + (rect.width() - bar_w) / 2.0
+                    painter.setBrush(QColor(accent.red(), accent.green(), accent.blue(), 85))
+                    painter.drawRoundedRect(QRectF(bx - 1.0, pos - 3.0, bar_w + 2.0, 6.0), 3.0, 3.0)
+                    painter.setBrush(accent)
+                    painter.drawRoundedRect(QRectF(bx, pos - 1.4, bar_w, 2.8), 1.4, 1.4)
+                else:
+                    bar_h = max(24.0, rect.height() - 16.0)
+                    by = rect.top() + (rect.height() - bar_h) / 2.0
+                    painter.setBrush(QColor(accent.red(), accent.green(), accent.blue(), 85))
+                    painter.drawRoundedRect(QRectF(pos - 3.0, by - 1.0, 6.0, bar_h + 2.0), 3.0, 3.0)
+                    painter.setBrush(accent)
+                    painter.drawRoundedRect(QRectF(pos - 1.4, by, 2.8, bar_h), 1.4, 1.4)
 
         painter.end()
 
@@ -601,6 +738,7 @@ class ProjectWindowRow(QWidget):
         notif: WindowNotificationState | None,
         width: int = 128,
         show_top_divider: bool = False,
+        show_left_divider: bool = False,
         theme: str = "dark",
         parent: QWidget | None = None,
     ):
@@ -612,6 +750,7 @@ class ProjectWindowRow(QWidget):
         self.is_active = is_active
         self.notif = notif or WindowNotificationState()
         self._show_top_divider = show_top_divider
+        self._show_left_divider = show_left_divider
         self._theme = theme
         self._hovered = False
         self._pressed = False
@@ -672,6 +811,8 @@ class ProjectWindowRow(QWidget):
 
         if self._show_top_divider and not self._hovered and not self.is_active and not self.notif.has_alert:
             painter.fillRect(QRectF(6, 0, self.width() - 12, 1.0), pal["row_divider"])
+        if self._show_left_divider and not self._hovered and not self.is_active and not self.notif.has_alert:
+            painter.fillRect(QRectF(0, 5, 1.0, self.height() - 10), pal["row_divider"])
 
         has_alert = self.notif.has_alert
         row_rect = QRectF(1.0, 2.0, self.width() - 2.0, self.height() - 4.0)
@@ -919,6 +1060,71 @@ class AgentWorkspaceCard(QWidget):
         painter.end()
 
 
+class AgentHorizontalStrip(QWidget):
+    """Horizontal wrapping frosted-glass strip of project windows aligned next to a vertical icon slot."""
+
+    window_clicked = Signal(int, str)
+    window_right_clicked = Signal(dict, int, QPoint)
+
+    def __init__(
+        self,
+        agent: dict[str, Any],
+        windows: list[dict[str, Any]],
+        foreground_hwnd: int,
+        notif_summary: AgentNotificationSummary,
+        chip_width: int = 106,
+        max_cols: int = 4,
+        theme: str = "dark",
+        alpha: int = 232,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self._theme = theme
+        self._alpha = alpha
+        self._shadow_pad = 5
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+
+        grid = QGridLayout(self)
+        grid.setContentsMargins(
+            self._shadow_pad + 5,
+            self._shadow_pad + 3,
+            self._shadow_pad + 5,
+            self._shadow_pad + 3,
+        )
+        grid.setHorizontalSpacing(2)
+        grid.setVerticalSpacing(2)
+
+        cols = max(1, int(max_cols))
+        for idx, w in enumerate(windows):
+            row_idx = idx // cols
+            col_idx = idx % cols
+            h = int(w["hwnd"])
+            row_widget = ProjectWindowRow(
+                agent=agent,
+                win_info=w,
+                is_active=(h == foreground_hwnd),
+                notif=notif_summary.by_hwnd.get(h),
+                width=chip_width,
+                show_top_divider=(row_idx > 0),
+                show_left_divider=(col_idx > 0),
+                theme=theme,
+                parent=self,
+            )
+            row_widget.clicked.connect(self.window_clicked.emit)
+            row_widget.right_clicked.connect(self.window_right_clicked.emit)
+            grid.addWidget(row_widget, row_idx, col_idx)
+
+        self.adjustSize()
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        pad = self._shadow_pad
+        rect = QRectF(pad, pad, self.width() - pad * 2, self.height() - pad * 2)
+        paint_apple_glass(painter, rect, radius=12.0, theme=self._theme, alpha=self._alpha)
+        painter.end()
+
+
 class CollapsedDockOrb(QWidget):
     """Compact macOS frosted-glass floating orb when AI docker auto-collapses during idle."""
 
@@ -1091,7 +1297,9 @@ class AgentDockWindow(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.config = load_config()
+        self._closing = False
         self._drag_offset: QPoint | None = None
+        self._drag_origin: QPoint | None = None
         self._buttons: dict[str, AgentIconButton] = {}
         self._icons: dict[str, QIcon] = {}
         self._web_icons = WebIconLoader(self)
@@ -1106,10 +1314,12 @@ class AgentDockWindow(QWidget):
         self._notif_tracker = NotificationTracker()
         self._shellhook_msg: int = 0
         self._shellhook_registered: bool = False
+        self._ipc_msg: int = 0
         self._cached_hwnd: int = 0
 
         self._collapsed: bool = False
         self._collapsed_anchor: QPoint | None = None
+        self._vertical_mirrored: bool = False
         self._expand_cooldown_until: float = 0.0
         self._menu_open: bool = False
         self._dialog_open: bool = False
@@ -1127,7 +1337,7 @@ class AgentDockWindow(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAcceptDrops(True)
 
-        self._root_layout = QVBoxLayout(self)
+        self._root_layout = QBoxLayout(QBoxLayout.TopToBottom, self)
         self._root_layout.setContentsMargins(0, 0, 0, 0)
         self._root_layout.setSpacing(2)
         self._root_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
@@ -1141,31 +1351,40 @@ class AgentDockWindow(QWidget):
         )
         self._orb.hovered.connect(self._on_orb_hovered)
         self._orb.hide()
-        self._root_layout.addWidget(self._orb, 0, Qt.AlignLeft)
+        self._root_layout.addWidget(self._orb, 0, Qt.AlignTop | Qt.AlignLeft)
 
-        self._top_bar = TopDockCapsule(theme=theme, alpha=self._capsule_alpha(), parent=self)
+        self._top_bar = TopDockCapsule(
+            theme=theme,
+            alpha=self._capsule_alpha(),
+            orientation=self._orientation(),
+            parent=self,
+        )
         self._top_bar.reorder_requested.connect(self._move_agent_to_visible_index)
         self._grip = DragGrip(
             height=int(self.config["ui"].get("button_size", 46)),
             theme=theme,
+            orientation=self._orientation(),
             parent=self._top_bar,
         )
-        self._root_layout.addWidget(self._top_bar, 0, Qt.AlignLeft)
+        self._grip.double_clicked.connect(self._on_grip_double_clicked)
+        self._root_layout.addWidget(self._top_bar, 0, Qt.AlignTop | Qt.AlignLeft)
 
         self._shelf = QWidget(self)
         self._shelf.setAttribute(Qt.WA_TranslucentBackground, True)
-        self._shelf_layout = QHBoxLayout(self._shelf)
+        self._shelf_layout = QBoxLayout(QBoxLayout.LeftToRight, self._shelf)
         self._shelf_layout.setContentsMargins(1, 0, 1, 0)
         self._shelf_layout.setSpacing(0)
         self._shelf_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self._shelf.hide()
-        self._root_layout.addWidget(self._shelf, 0, Qt.AlignLeft)
+        self._root_layout.addWidget(self._shelf, 0, Qt.AlignTop | Qt.AlignLeft)
 
         self._apply_styles()
         self._rebuild_dock(force_refresh_icons=False)
         self._restore_position()
         self._collapsed_anchor = self.pos()
-        self.move(self._clamp_expanded_position(self._collapsed_anchor))
+        self._apply_layout_orientation(self._vertical_mirror_right(self._collapsed_anchor))
+        self.adjustSize()
+        self.move(self._expanded_pos_for_anchor(self._collapsed_anchor))
 
         self._collapse_timer = QTimer(self)
         self._collapse_timer.setSingleShot(True)
@@ -1253,12 +1472,31 @@ class AgentDockWindow(QWidget):
         if self._collapsed and time.monotonic() >= self._expand_cooldown_until:
             self._expand_dock()
 
+    def _on_grip_double_clicked(self) -> None:
+        self._drag_offset = None
+        self._drag_origin = None
+        if not self._collapsed:
+            self._collapsed_anchor = self._anchor_for_current_pos()
+            self._collapse_dock(force=True)
+
     def _expand_dock(self) -> None:
         self._cancel_auto_collapse()
         self._expand_cooldown_until = 0.0
         if not self._collapsed:
             return
         self._collapsed_anchor = self.pos()
+        layout_changed = self._apply_layout_orientation(
+            self._vertical_mirror_right(self._collapsed_anchor)
+        )
+        if layout_changed:
+            self._last_shelf_sig = None
+            self._rebuild_shelf(
+                agents=self.config.get("agents", []),
+                agent_windows=self._agent_windows,
+                foreground_hwnd=get_foreground_hwnd(),
+                notif_map=self._last_notif_map,
+                show_list=bool(self.config["ui"].get("show_window_list", True)),
+            )
         self._orb.hide()
         self._top_bar.show()
         show_list = bool(self.config["ui"].get("show_window_list", True))
@@ -1269,19 +1507,26 @@ class AgentDockWindow(QWidget):
         self._collapsed = False
         self.adjustSize()
 
-        self.move(self._clamp_expanded_position(self._collapsed_anchor))
+        self.move(self._expanded_pos_for_anchor(self._collapsed_anchor))
         self.update()
 
-    def _reposition_after_rebuild(self, top_left: QPoint) -> None:
+    def _reposition_after_rebuild(self, anchor: QPoint) -> None:
         if self._collapsed:
-            self.move(top_left)
+            self.move(anchor)
         else:
-            self.move(self._clamp_expanded_position(top_left))
+            self._collapsed_anchor = anchor
+            self.move(self._expanded_pos_for_anchor(anchor))
 
-    def _persist_config(self) -> bool:
+    def _persist_config(
+        self, *, ui: dict[str, Any] | None = None, agents: list[dict[str, Any]] | None = None
+    ) -> bool:
+        candidate = dict(self.config)
+        if ui is not None:
+            candidate["ui"] = {**self.config["ui"], **ui}
+        if agents is not None:
+            candidate["agents"] = agents
         try:
-            save_config(self.config)
-            return True
+            save_config(candidate)
         except OSError as exc:
             QMessageBox.warning(
                 self,
@@ -1289,6 +1534,14 @@ class AgentDockWindow(QWidget):
                 f"无法写入 agents.json（可能正被其他程序占用）：\n{exc}",
             )
             return False
+        self.config = candidate
+        if agents is not None:
+            for agent in agents:
+                button = self._buttons.get(agent.get("id", ""))
+                if button is not None:
+                    button.agent = agent
+            self._last_shelf_sig = None
+        return True
 
     def _clamp_expanded_position(self, position: QPoint) -> QPoint:
         screen = QGuiApplication.screenAt(position + QPoint(24, 24)) or QGuiApplication.primaryScreen()
@@ -1321,6 +1574,91 @@ class AgentDockWindow(QWidget):
         t = str(self.config["ui"].get("theme", "dark")).lower()
         return "light" if t == "light" else "dark"
 
+    def _orientation(self) -> str:
+        val = str(self.config["ui"].get("orientation", "horizontal")).strip().lower()
+        return "vertical" if val == "vertical" else "horizontal"
+
+    def _is_vertical(self) -> bool:
+        return self._orientation() == "vertical"
+
+    def _vertical_mirror_right(self, anchor: QPoint | None = None) -> bool:
+        if not self._is_vertical():
+            return False
+        pt = anchor if anchor is not None else (self._collapsed_anchor or self.pos())
+        screen = QGuiApplication.screenAt(pt + QPoint(24, 24)) or QGuiApplication.primaryScreen()
+        if screen is None:
+            return False
+        geo = screen.availableGeometry()
+        return (pt.x() + self._orb.width() / 2.0) > geo.center().x()
+
+    def _apply_layout_orientation(self, mirror_right: bool | None = None) -> bool:
+        is_vert = self._is_vertical()
+        target_mirrored = (
+            bool(mirror_right)
+            if (is_vert and mirror_right is not None)
+            else (self._vertical_mirror_right() if is_vert else False)
+        )
+        mirrored_changed = target_mirrored != self._vertical_mirrored
+        self._vertical_mirrored = target_mirrored
+
+        if is_vert:
+            self._root_layout.setDirection(QBoxLayout.LeftToRight)
+            self._root_layout.setSpacing(2)
+            desired_order = (
+                [self._orb, self._shelf, self._top_bar]
+                if self._vertical_mirrored
+                else [self._orb, self._top_bar, self._shelf]
+            )
+            self._shelf_layout.setDirection(QBoxLayout.TopToBottom)
+            top_offset = self._top_bar.first_icon_top_offset(16)
+            self._shelf_layout.setContentsMargins(0, top_offset, 0, 0)
+            self._shelf_layout.setSpacing(4)
+            self._shelf_layout.setAlignment(
+                Qt.AlignTop | (Qt.AlignRight if self._vertical_mirrored else Qt.AlignLeft)
+            )
+        else:
+            self._root_layout.setDirection(QBoxLayout.TopToBottom)
+            self._root_layout.setSpacing(2)
+            desired_order = [self._orb, self._top_bar, self._shelf]
+            self._shelf_layout.setDirection(QBoxLayout.LeftToRight)
+            self._shelf_layout.setContentsMargins(1, 0, 1, 0)
+            self._shelf_layout.setSpacing(0)
+            self._shelf_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+
+        current_order = [
+            self._root_layout.itemAt(i).widget()
+            for i in range(self._root_layout.count())
+        ]
+        if current_order != desired_order:
+            for w in desired_order:
+                self._root_layout.removeWidget(w)
+            for w in desired_order:
+                self._root_layout.addWidget(w, 0, Qt.AlignTop | Qt.AlignLeft)
+            self._root_layout.invalidate()
+        return mirrored_changed
+
+    def _expanded_pos_for_anchor(self, anchor: QPoint) -> QPoint:
+        if self._is_vertical() and self._vertical_mirrored:
+            raw = QPoint(anchor.x() + self._orb.width() - self.width(), anchor.y())
+            return self._clamp_expanded_position(raw)
+        return self._clamp_expanded_position(anchor)
+
+    def _anchor_for_current_pos(self) -> QPoint:
+        if self._collapsed or not (self._is_vertical() and self._vertical_mirrored):
+            return self.pos()
+        return QPoint(self.x() + self.width() - self._orb.width(), self.y())
+
+    def _vertical_max_cols(self, chip_width: int) -> int:
+        pt = self._collapsed_anchor or self.pos()
+        screen = QGuiApplication.screenAt(pt + QPoint(24, 24)) or QGuiApplication.primaryScreen()
+        if screen is None:
+            return 4
+        geo = screen.availableGeometry()
+        bar_w = self._top_bar.width() or (int(self.config["ui"].get("button_size", 46)) + 26)
+        avail_w = geo.width() - bar_w - 36
+        cols = (avail_w - 20) // max(1, chip_width + 2)
+        return max(1, min(6, int(cols)))
+
     def _capsule_alpha(self) -> int:
         opacity = float(self.config["ui"].get("opacity", 0.92))
         return max(170, min(248, int(opacity * 255)))
@@ -1339,15 +1677,33 @@ class AgentDockWindow(QWidget):
                 )
             except Exception:
                 self._shellhook_registered = False
+        if self._cached_hwnd:
+            user32.SetPropW(self._cached_hwnd, _INSTALL_PROPERTY, 1)
+            if not self._ipc_msg:
+                try:
+                    self._ipc_msg = int(user32.RegisterWindowMessageW(IPC_CONTROL_MESSAGE_NAME))
+                except Exception:
+                    self._ipc_msg = 0
 
     def nativeEvent(self, eventType, message):
-        if self._shellhook_registered and self._shellhook_msg and eventType in (
+        if eventType in (
             b"windows_generic_MSG",
             b"windows_dispatcher_MSG",
         ):
             try:
                 msg = wintypes.MSG.from_address(int(message))
-                if msg.message == self._shellhook_msg:
+                if self._ipc_msg and msg.message == self._ipc_msg:
+                    cmd = int(msg.wParam)
+                    if cmd == IPC_CMD_RELOAD:
+                        QTimer.singleShot(0, lambda: self._reload_all(force_refresh_icons=False, silent=True))
+                    elif cmd == IPC_CMD_EXPAND:
+                        QTimer.singleShot(0, self._expand_dock)
+                    elif cmd == IPC_CMD_COLLAPSE:
+                        QTimer.singleShot(0, lambda: self._collapse_dock(force=True))
+                    elif cmd == IPC_CMD_CLEAR_NOTIFICATIONS:
+                        QTimer.singleShot(0, self._clear_all_notifications)
+                    return True, 0
+                if self._shellhook_registered and self._shellhook_msg and msg.message == self._shellhook_msg:
                     code = int(msg.wParam)
                     target_hwnd = int(msg.lParam)
                     if code == HSHELL_FLASH and target_hwnd:
@@ -1360,17 +1716,35 @@ class AgentDockWindow(QWidget):
                 pass
         return super().nativeEvent(eventType, message)
 
-    # --- Drag & Drop .exe / .lnk directly onto dock to add Agent ---
+    # --- Drag & Drop .exe / .lnk / .url / web URLs directly onto dock to add Agent ---
+    def _extract_drop_payload(self, mime_data) -> tuple[list[str], str | None]:
+        exe_files: list[str] = []
+        web_url: str | None = None
+        if mime_data.hasUrls():
+            for url in mime_data.urls():
+                if url.isLocalFile():
+                    local = url.toLocalFile()
+                    low = local.lower()
+                    if low.endswith((".exe", ".lnk")):
+                        exe_files.append(local)
+                    elif low.endswith(".url") and web_url is None:
+                        web_url = read_internet_shortcut_url(local)
+                elif url.scheme().lower() in ("http", "https") and web_url is None:
+                    web_url = normalize_web_url(url.toString())
+        elif mime_data.hasText():
+            text = mime_data.text().strip()
+            if text.lower().startswith(("http://", "https://")) and "\n" not in text:
+                web_url = normalize_web_url(text)
+        return exe_files, web_url
+
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if event.mimeData().hasUrls():
-            for url in event.mimeData().urls():
-                local = url.toLocalFile()
-                if local and local.lower().endswith((".exe", ".lnk")):
-                    self._cancel_auto_collapse()
-                    self._top_bar.set_drop_highlight(True)
-                    self._orb.set_drop_highlight(True)
-                    event.acceptProposedAction()
-                    return
+        exe_files, web_url = self._extract_drop_payload(event.mimeData())
+        if exe_files or web_url:
+            self._cancel_auto_collapse()
+            self._top_bar.set_drop_highlight(True)
+            self._orb.set_drop_highlight(True)
+            event.acceptProposedAction()
+            return
         event.ignore()
 
     def dragLeaveEvent(self, event: QDragLeaveEvent) -> None:
@@ -1382,42 +1756,47 @@ class AgentDockWindow(QWidget):
     def dropEvent(self, event: QDropEvent) -> None:
         self._top_bar.set_drop_highlight(False)
         self._orb.set_drop_highlight(False)
-        added = 0
+        exe_files, web_url = self._extract_drop_payload(event.mimeData())
+        agents = list(self.config["agents"])
+        found = False
         existing_paths = {
-            os.path.normcase(os.path.normpath(a.get("path", "")))
-            for a in self.config.get("agents", [])
-            if a.get("path")
+            os.path.normcase(os.path.normpath(agent["path"])): index
+            for index, agent in enumerate(agents)
+            if agent.get("path")
         }
-        for url in event.mimeData().urls():
-            local = url.toLocalFile()
-            if not local or not local.lower().endswith((".exe", ".lnk")):
-                continue
-            new_agent = build_agent_from_file(local, self.config.get("agents", []))
+        for local in exe_files:
+            new_agent = build_agent_from_file(local, agents)
             if not new_agent:
                 continue
             norm = os.path.normcase(os.path.normpath(new_agent["path"]))
-            if norm in existing_paths:
-                # Re-enable if it already existed but was hidden
-                for a in self.config["agents"]:
-                    if a.get("path") and os.path.normcase(os.path.normpath(a["path"])) == norm:
-                        a["enabled"] = True
-                        added += 1
-                        break
-                continue
-            existing_paths.add(norm)
-            self.config["agents"].append(new_agent)
-            added += 1
+            index = existing_paths.get(norm)
+            if index is None:
+                existing_paths[norm] = len(agents)
+                agents.append(new_agent)
+            elif agents[index].get("enabled", True) is False:
+                agents[index] = {**agents[index], "enabled": True}
+            found = True
 
-        if added > 0:
-            self._persist_config()
+        if found and (agents == self.config["agents"] or self._persist_config(agents=agents)):
             if self._collapsed:
                 self._expand_dock()
-            top_left = self.pos()
+            anchor = self._anchor_for_current_pos()
             self._rebuild_dock(force_refresh_icons=False)
-            self._reposition_after_rebuild(top_left)
             self._refresh_state()
-            self._schedule_auto_collapse()
+            self._reposition_after_rebuild(anchor)
             event.acceptProposedAction()
+            self._schedule_auto_collapse()
+            return
+
+        if web_url:
+            event.acceptProposedAction()
+            QTimer.singleShot(
+                0,
+                lambda u=web_url: self._open_add_dialog(initial_type="web", initial_url=u),
+            )
+            return
+
+        self._schedule_auto_collapse()
 
     def _apply_styles(self) -> None:
         theme = self._theme()
@@ -1445,6 +1824,8 @@ class AgentDockWindow(QWidget):
     def _rebuild_dock(self, force_refresh_icons: bool = False) -> None:
         ui = self.config["ui"]
         theme = self._theme()
+        orientation = self._orientation()
+        is_vert = orientation == "vertical"
         btn_size = int(ui.get("button_size", 46))
         icon_size = int(ui.get("icon_size", 32))
         if force_refresh_icons:
@@ -1454,15 +1835,19 @@ class AgentDockWindow(QWidget):
             item = self._top_bar.row_layout.takeAt(0)
             w = item.widget()
             if w is not None and w is not self._grip:
+                w.hide()
+                w.setParent(None)
                 w.deleteLater()
         self._buttons.clear()
         self._icons.clear()
 
+        self._top_bar.set_orientation(orientation)
         self._grip.set_theme(theme)
-        self._grip.setFixedSize(16, btn_size)
+        self._grip.set_orientation(orientation, btn_size)
         self._top_bar.row_layout.addWidget(self._grip)
 
         btn_list: list[AgentIconButton] = []
+        slot_map: dict[str, QWidget] = {}
         for agent in self.config.get("agents", []):
             if agent.get("enabled", True) is False:
                 continue
@@ -1477,18 +1862,39 @@ class AgentDockWindow(QWidget):
                 button_size=btn_size,
                 icon_size=icon_size,
                 theme=theme,
+                orientation=orientation,
                 parent=self._top_bar,
             )
             btn.clicked.connect(self._on_agent_clicked)
             btn.double_clicked.connect(self._on_agent_double_clicked)
             btn.right_clicked.connect(self._on_agent_right_clicked)
-            self._top_bar.row_layout.addWidget(btn)
+            if is_vert:
+                slot = QWidget(self._top_bar)
+                slot.setAttribute(Qt.WA_TranslucentBackground, True)
+                slot.setMouseTracking(True)
+                slot.setFixedSize(btn.width(), btn_size)
+                slot_layout = QVBoxLayout(slot)
+                slot_layout.setContentsMargins(0, 0, 0, 0)
+                slot_layout.setSpacing(0)
+                slot_layout.setAlignment(Qt.AlignCenter)
+                slot_layout.addWidget(btn)
+                btn.show()
+                slot.show()
+                self._top_bar.row_layout.addWidget(slot)
+                slot_map[aid] = slot
+            else:
+                btn.show()
+                self._top_bar.row_layout.addWidget(btn)
             self._buttons[aid] = btn
             btn_list.append(btn)
 
         self._top_bar.set_icon_buttons(btn_list)
+        self._top_bar.set_slot_widgets(slot_map)
+        self._apply_layout_orientation()
         self._last_shelf_sig = None
+        self._top_bar.row_layout.activate()
         self._top_bar.adjustSize()
+        self._root_layout.activate()
         self.adjustSize()
         self.update()
 
@@ -1511,15 +1917,25 @@ class AgentDockWindow(QWidget):
         show_list: bool,
     ) -> bool:
         theme = self._theme()
+        orientation = self._orientation()
+        is_vert = orientation == "vertical"
+        btn_size = int(self.config["ui"].get("button_size", 46))
+        card_width = int(self.config["ui"].get("window_chip_width", 138))
+        max_cols = self._vertical_max_cols(card_width) if is_vert else 0
+
         sig_cards = []
+        enabled_agents: list[dict[str, Any]] = []
         active_agents: list[dict[str, Any]] = []
         if show_list:
             for ag in agents:
                 if ag.get("enabled", True) is False:
                     continue
+                enabled_agents.append(ag)
                 aid = ag.get("id", "")
                 wins = agent_windows.get(aid, [])
                 if not wins:
+                    if is_vert:
+                        sig_cards.append((aid, ()))
                     continue
                 active_agents.append(ag)
                 summary = notif_map.get(aid, AgentNotificationSummary())
@@ -1537,7 +1953,16 @@ class AgentDockWindow(QWidget):
                 )
                 sig_cards.append((aid, win_sigs))
 
-        new_sig = (theme, bool(show_list), tuple(sig_cards))
+        new_sig = (
+            theme,
+            orientation,
+            self._vertical_mirrored if is_vert else False,
+            card_width,
+            btn_size,
+            max_cols,
+            bool(show_list),
+            tuple(sig_cards),
+        )
         if new_sig == self._last_shelf_sig:
             return False
         self._last_shelf_sig = new_sig
@@ -1546,10 +1971,65 @@ class AgentDockWindow(QWidget):
             item = self._shelf_layout.takeAt(0)
             w = item.widget()
             if w is not None:
+                w.hide()
+                w.setParent(None)
                 w.deleteLater()
 
+        if is_vert:
+            slot_heights: dict[str, int] = {}
+            if show_list and active_agents:
+                alpha = self._capsule_alpha()
+                horiz_align = Qt.AlignRight if self._vertical_mirrored else Qt.AlignLeft
+                for ag in enabled_agents:
+                    aid = ag.get("id", "")
+                    wins = agent_windows.get(aid, [])
+                    if not wins:
+                        placeholder = QWidget(self._shelf)
+                        placeholder.setAttribute(Qt.WA_TranslucentBackground, True)
+                        placeholder.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                        placeholder.setFixedSize(1, btn_size)
+                        placeholder.show()
+                        self._shelf_layout.addWidget(placeholder, 0, horiz_align)
+                        continue
+                    summary = notif_map.get(aid, AgentNotificationSummary())
+                    strip = AgentHorizontalStrip(
+                        agent=ag,
+                        windows=wins,
+                        foreground_hwnd=foreground_hwnd,
+                        notif_summary=summary,
+                        chip_width=card_width,
+                        max_cols=max_cols,
+                        theme=theme,
+                        alpha=alpha,
+                        parent=self._shelf,
+                    )
+                    strip.window_clicked.connect(self._on_window_chip_clicked)
+                    strip.window_right_clicked.connect(self._on_window_chip_right_clicked)
+                    row_h = max(btn_size, strip.sizeHint().height())
+                    slot_heights[aid] = row_h
+                    row_box = QWidget(self._shelf)
+                    row_box.setAttribute(Qt.WA_TranslucentBackground, True)
+                    row_box.setFixedHeight(row_h)
+                    row_layout = QHBoxLayout(row_box)
+                    row_layout.setContentsMargins(0, 0, 0, 0)
+                    row_layout.setSpacing(0)
+                    row_layout.setAlignment(horiz_align | Qt.AlignVCenter)
+                    row_layout.addWidget(strip)
+                    strip.show()
+                    row_box.show()
+                    self._shelf_layout.addWidget(row_box, 0, horiz_align)
+
+                self._top_bar.set_slot_heights(slot_heights, btn_size)
+                self._shelf_layout.activate()
+                self._shelf.adjustSize()
+                if not self._collapsed:
+                    self._shelf.show()
+            else:
+                self._top_bar.set_slot_heights({}, btn_size)
+                self._shelf.hide()
+            return True
+
         if active_agents:
-            card_width = int(self.config["ui"].get("window_chip_width", 138))
             alpha = self._capsule_alpha()
             for ag in active_agents:
                 aid = ag.get("id", "")
@@ -1571,7 +2051,9 @@ class AgentDockWindow(QWidget):
                 card.header_right_clicked.connect(self._on_agent_right_clicked)
                 card.window_clicked.connect(self._on_window_chip_clicked)
                 card.window_right_clicked.connect(self._on_window_chip_right_clicked)
+                card.show()
                 self._shelf_layout.addWidget(card, 0, Qt.AlignTop)
+            self._shelf_layout.activate()
             self._shelf.adjustSize()
             if not self._collapsed:
                 self._shelf.show()
@@ -1596,10 +2078,9 @@ class AgentDockWindow(QWidget):
             y = geo.top() + 14
             self.move(x, y)
 
-    def _save_position(self) -> None:
-        pos = self.pos()
-        self.config["ui"]["pos"] = [pos.x(), pos.y()]
-        self._persist_config()
+    def _save_position(self, anchor: QPoint | None = None) -> bool:
+        pos = anchor if anchor is not None else self._anchor_for_current_pos()
+        return self._persist_config(ui={"pos": [pos.x(), pos.y()]})
 
     def _update_orb_state(
         self,
@@ -1647,6 +2128,8 @@ class AgentDockWindow(QWidget):
             )
 
     def _refresh_state(self) -> None:
+        if self._closing:
+            return
         ui = self.config["ui"]
         show_dot = bool(ui.get("show_running_dot", True))
         show_list = bool(ui.get("show_window_list", True))
@@ -1681,11 +2164,14 @@ class AgentDockWindow(QWidget):
             show_list=show_list,
         )
         if shelf_changed and not self._collapsed:
-            top_left = self.pos()
+            self._root_layout.activate()
             self.adjustSize()
             if self._drag_offset is None:
-                top_left = self._clamp_expanded_position(top_left)
-            self.move(top_left)
+                if self._is_vertical() and self._vertical_mirrored and self._collapsed_anchor is not None:
+                    target_pos = self._expanded_pos_for_anchor(self._collapsed_anchor)
+                else:
+                    target_pos = self._clamp_expanded_position(self.pos())
+                self.move(target_pos)
             self.update()
 
         if hide_enabled:
@@ -1705,17 +2191,35 @@ class AgentDockWindow(QWidget):
 
     def _on_agent_clicked(self, agent: dict[str, Any]) -> None:
         aid = agent.get("id", "")
-        wins = self._agent_windows.get(aid, [])
-        if len(wins) <= 1:
-            self._notif_tracker.clear_agent(aid, [w["hwnd"] for w in wins])
-        else:
-            self._notif_tracker.clear_agent_unattributed(aid)
-
         focus_existing = bool(self.config["ui"].get("focus_existing", True))
-        ok, msg = launch_agent(agent, focus_existing=focus_existing)
+        preferred_hwnds: list[int] | None = None
+        if focus_existing:
+            raw_preferred = self._notif_tracker.get_alert_hwnds()
+            if isinstance(raw_preferred, (list, tuple)):
+                preferred_hwnds = list(raw_preferred)
+
+        ok, msg = launch_agent(
+            agent,
+            focus_existing=focus_existing,
+            agents=self.config["agents"],
+            preferred_hwnds=preferred_hwnds,
+        )
         if not ok:
             QMessageBox.warning(self, "AI docker 启动失败", f"{agent.get('name', '')}: {msg}")
+            return
+
+        if msg.startswith("focused:"):
+            focused_hwnd = get_last_focused_hwnd(aid or agent.get("name") or "")
+            if focused_hwnd:
+                self._notif_tracker.clear_window(focused_hwnd)
+            self._notif_tracker.clear_agent_unattributed(aid)
+            QTimer.singleShot(180, self._refresh_state)
         else:
+            wins = self._agent_windows.get(aid, [])
+            if len(wins) <= 1:
+                self._notif_tracker.clear_agent(aid, [w["hwnd"] for w in wins])
+            else:
+                self._notif_tracker.clear_agent_unattributed(aid)
             QTimer.singleShot(350, self._refresh_state)
 
     def _on_agent_double_clicked(self, agent: dict[str, Any]) -> None:
@@ -1730,6 +2234,18 @@ class AgentDockWindow(QWidget):
         self._notif_tracker.clear_agent_unattributed(agent_id)
         focus_hwnd(hwnd)
         QTimer.singleShot(180, self._refresh_state)
+
+    def _on_window_chip_close_requested(self, hwnd: int, agent_id: str) -> None:
+        if close_hwnd(hwnd):
+            self._notif_tracker.clear_window(hwnd)
+            QTimer.singleShot(250, self._refresh_state)
+        else:
+            QMessageBox.warning(
+                self,
+                "AI docker 关闭窗口失败",
+                "无法关闭该窗口（窗口可能已关闭，或目标进程权限更高）。",
+            )
+            QTimer.singleShot(150, self._refresh_state)
 
     def _on_agent_right_clicked(self, agent: dict[str, Any], global_pos: QPoint) -> None:
         self._show_context_menu(global_pos, agent=agent, target_hwnd=None)
@@ -1762,6 +2278,11 @@ class AgentDockWindow(QWidget):
                 act_clear_win.triggered.connect(
                     lambda: (self._notif_tracker.clear_window(target_hwnd, aid), self._refresh_state())
                 )
+            act_close = menu.addAction("关闭该窗口")
+            act_close.setProperty("destructive", True)
+            act_close.triggered.connect(
+                lambda checked=False, h=target_hwnd, a=aid: self._on_window_chip_close_requested(h, a)
+            )
             menu.addSeparator()
         elif open_wins:
             for w in open_wins[:8]:
@@ -1812,24 +2333,25 @@ class AgentDockWindow(QWidget):
             cur_vis_idx = visible_ids.index(aid) if aid in visible_ids else -1
 
             if visible_count > 1 and cur_vis_idx >= 0:
+                is_vert = self._is_vertical()
                 move_menu = menu.addMenu("调整位置")
-                act_left = move_menu.addAction("向左移一位")
-                act_left.setEnabled(cur_vis_idx > 0)
-                act_left.triggered.connect(
+                act_prev = move_menu.addAction("向上移一位" if is_vert else "向左移一位")
+                act_prev.setEnabled(cur_vis_idx > 0)
+                act_prev.triggered.connect(
                     lambda checked=False, a=aid: self._shift_agent(a, -1)
                 )
-                act_right = move_menu.addAction("向右移一位")
-                act_right.setEnabled(cur_vis_idx < visible_count - 1)
-                act_right.triggered.connect(
+                act_next = move_menu.addAction("向下移一位" if is_vert else "向右移一位")
+                act_next.setEnabled(cur_vis_idx < visible_count - 1)
+                act_next.triggered.connect(
                     lambda checked=False, a=aid: self._shift_agent(a, 1)
                 )
                 move_menu.addSeparator()
-                act_first = move_menu.addAction("移到最左")
+                act_first = move_menu.addAction("移到最顶" if is_vert else "移到最左")
                 act_first.setEnabled(cur_vis_idx > 0)
                 act_first.triggered.connect(
                     lambda checked=False, a=aid: self._move_agent_to_visible_index(a, 0)
                 )
-                act_last = move_menu.addAction("移到最右")
+                act_last = move_menu.addAction("移到最底" if is_vert else "移到最右")
                 act_last.setEnabled(cur_vis_idx < visible_count - 1)
                 act_last.triggered.connect(
                     lambda checked=False, a=aid, last=visible_count - 1: self._move_agent_to_visible_index(a, last)
@@ -1873,8 +2395,11 @@ class AgentDockWindow(QWidget):
         discover_act = agent_menu.addAction("扫描本机新安装的 Agent...")
         discover_act.triggered.connect(self._open_discover_dialog)
 
-        add_act = agent_menu.addAction("添加新 Agent...（或直接拖入 .exe/.lnk）")
-        add_act.triggered.connect(self._open_add_dialog)
+        add_web_act = agent_menu.addAction("添加网页 Agent (URL)...")
+        add_web_act.triggered.connect(lambda: self._open_add_dialog(initial_type="web"))
+
+        add_act = agent_menu.addAction("添加桌面 / CLI Agent...（或拖入 .exe/.lnk/.url）")
+        add_act.triggered.connect(lambda: self._open_add_dialog(initial_type="exe"))
 
         agent_menu.addSeparator()
 
@@ -1929,6 +2454,17 @@ class AgentDockWindow(QWidget):
             reclaim_all_act.triggered.connect(self._reclaim_all_released)
 
         behavior_menu = menu.addMenu("显示与行为")
+        is_vert = self._is_vertical()
+        layout_menu = behavior_menu.addMenu("布局方向")
+        horiz_act = layout_menu.addAction("横向布局（顶栏图标 + 下方卡片）")
+        horiz_act.setCheckable(True)
+        horiz_act.setChecked(not is_vert)
+        horiz_act.triggered.connect(lambda checked=False: self._set_orientation("horizontal"))
+        vert_act = layout_menu.addAction("纵向布局（侧边图标 + 同行窗口）")
+        vert_act.setCheckable(True)
+        vert_act.setChecked(is_vert)
+        vert_act.triggered.connect(lambda checked=False: self._set_orientation("vertical"))
+
         auto_collapse_on = self._auto_collapse_enabled()
         auto_collapse_act = behavior_menu.addAction("空闲自动收缩为悬浮图标")
         auto_collapse_act.setCheckable(True)
@@ -2029,35 +2565,41 @@ class AgentDockWindow(QWidget):
         try:
             dlg = DiscoverAgentsDialog(self.config.get("agents", []), theme=self._theme(), parent=self)
             if dlg.exec() and dlg.selected_agents:
-                self.config["agents"].extend(dlg.selected_agents)
-                self._persist_config()
+                if not self._persist_config(agents=[*self.config["agents"], *dlg.selected_agents]):
+                    return
                 if self._collapsed:
                     self._expand_dock()
-                top_left = self.pos()
+                anchor = self._anchor_for_current_pos()
                 self._rebuild_dock(force_refresh_icons=False)
-                self._reposition_after_rebuild(top_left)
                 self._refresh_state()
+                self._reposition_after_rebuild(anchor)
         finally:
             if dlg is not None:
                 dlg.deleteLater()
             self._dialog_open = False
             self._schedule_auto_collapse()
 
-    def _open_add_dialog(self) -> None:
+    def _open_add_dialog(self, initial_type: str = "exe", initial_url: str = "") -> None:
         self._dialog_open = True
         self._cancel_auto_collapse()
         dlg: AddAgentDialog | None = None
         try:
-            dlg = AddAgentDialog(self.config.get("agents", []), theme=self._theme(), parent=self)
+            dlg = AddAgentDialog(
+                self.config.get("agents", []),
+                theme=self._theme(),
+                parent=self,
+                initial_type=initial_type,
+                initial_url=initial_url,
+            )
             if dlg.exec() and dlg.created_agent:
-                self.config["agents"].append(dlg.created_agent)
-                self._persist_config()
+                if not self._persist_config(agents=[*self.config["agents"], dlg.created_agent]):
+                    return
                 if self._collapsed:
                     self._expand_dock()
-                top_left = self.pos()
+                anchor = self._anchor_for_current_pos()
                 self._rebuild_dock(force_refresh_icons=False)
-                self._reposition_after_rebuild(top_left)
                 self._refresh_state()
+                self._reposition_after_rebuild(anchor)
         finally:
             if dlg is not None:
                 dlg.deleteLater()
@@ -2071,8 +2613,8 @@ class AgentDockWindow(QWidget):
             self._collapse_dock(force=True)
 
     def _toggle_auto_collapse(self, checked: bool) -> None:
-        self.config["ui"]["auto_collapse"] = bool(checked)
-        self._persist_config()
+        if not self._persist_config(ui={"auto_collapse": bool(checked)}):
+            return
         if not checked:
             self._cancel_auto_collapse()
             self._expand_dock()
@@ -2080,22 +2622,34 @@ class AgentDockWindow(QWidget):
             self._schedule_auto_collapse()
 
     def _set_auto_collapse_seconds(self, seconds: int) -> None:
-        self.config["ui"]["auto_collapse_seconds"] = max(2, int(seconds))
-        self.config["ui"]["auto_collapse"] = True
-        self._persist_config()
-        self._schedule_auto_collapse()
+        if self._persist_config(ui={"auto_collapse_seconds": max(2, int(seconds)), "auto_collapse": True}):
+            self._schedule_auto_collapse()
+
+    def _set_orientation(self, orientation: str) -> None:
+        target = "vertical" if orientation == "vertical" else "horizontal"
+        if target == self._orientation():
+            return
+        anchor = self._anchor_for_current_pos()
+        if not self._persist_config(ui={"orientation": target}):
+            return
+        if not self._collapsed:
+            self._collapsed_anchor = anchor
+        self._rebuild_dock(force_refresh_icons=False)
+        self._refresh_state()
+        self._reposition_after_rebuild(anchor)
 
     def _toggle_theme(self) -> None:
-        self.config["ui"]["theme"] = "light" if self._theme() == "dark" else "dark"
-        self._persist_config()
-        top_left = self.pos()
+        theme = "light" if self._theme() == "dark" else "dark"
+        anchor = self._anchor_for_current_pos()
+        if not self._persist_config(ui={"theme": theme}):
+            return
         self._apply_styles()
         self._rebuild_dock(force_refresh_icons=False)
-        self._reposition_after_rebuild(top_left)
         self._refresh_state()
+        self._reposition_after_rebuild(anchor)
 
     def _move_agent_to_visible_index(self, agent_id: str, new_visible_idx: int) -> None:
-        agents = self.config.get("agents", [])
+        agents = list(self.config["agents"])
         visible_slots = [i for i, a in enumerate(agents) if a.get("enabled", True) is not False]
         visible_items = [agents[i] for i in visible_slots]
 
@@ -2113,11 +2667,12 @@ class AgentDockWindow(QWidget):
         for slot_idx, item in zip(visible_slots, visible_items):
             agents[slot_idx] = item
 
-        self._persist_config()
-        top_left = self.pos()
+        if not self._persist_config(agents=agents):
+            return
+        anchor = self._anchor_for_current_pos()
         self._rebuild_dock(force_refresh_icons=False)
-        self._reposition_after_rebuild(top_left)
         self._refresh_state()
+        self._reposition_after_rebuild(anchor)
 
     def _shift_agent(self, agent_id: str, delta: int) -> None:
         agents = self.config.get("agents", [])
@@ -2128,85 +2683,70 @@ class AgentDockWindow(QWidget):
         self._move_agent_to_visible_index(agent_id, cur_idx + delta)
 
     def _set_agent_visible(self, agent_id: str, visible: bool) -> None:
-        agents = self.config.get("agents", [])
+        agents = list(self.config["agents"])
         if not visible:
             visible_count = sum(1 for a in agents if a.get("enabled", True) is not False)
             if visible_count <= 1:
                 return
         changed = False
-        for a in agents:
+        for index, a in enumerate(agents):
             if a.get("id") == agent_id:
                 if (a.get("enabled", True) is not False) != visible:
-                    a["enabled"] = visible
+                    agents[index] = {**a, "enabled": visible}
                     changed = True
                 break
-        if not changed:
+        if not changed or not self._persist_config(agents=agents):
             return
-        self._persist_config()
-        top_left = self.pos()
+        anchor = self._anchor_for_current_pos()
         self._rebuild_dock(force_refresh_icons=False)
-        self._reposition_after_rebuild(top_left)
         self._refresh_state()
+        self._reposition_after_rebuild(anchor)
 
     def _show_all_agents(self) -> None:
-        changed = False
-        for a in self.config.get("agents", []):
-            if a.get("enabled", True) is False:
-                a["enabled"] = True
-                changed = True
-        if not changed:
+        previous = self.config["agents"]
+        agents = [{**agent, "enabled": True} if agent.get("enabled") is False else agent for agent in previous]
+        if agents == previous or not self._persist_config(agents=agents):
             return
-        self._persist_config()
-        top_left = self.pos()
+        anchor = self._anchor_for_current_pos()
         self._rebuild_dock(force_refresh_icons=False)
-        self._reposition_after_rebuild(top_left)
         self._refresh_state()
+        self._reposition_after_rebuild(anchor)
 
     def _toggle_show_window_list(self, checked: bool) -> None:
-        self.config["ui"]["show_window_list"] = bool(checked)
-        self._persist_config()
-        self._refresh_state()
+        if self._persist_config(ui={"show_window_list": bool(checked)}):
+            self._refresh_state()
 
     def _toggle_hide_from_taskbar(self, checked: bool) -> None:
-        self.config["ui"]["hide_from_taskbar"] = bool(checked)
-        self._persist_config()
+        if not self._persist_config(ui={"hide_from_taskbar": bool(checked)}):
+            return
         if not checked:
             self._taskbar_hider.restore_all()
         self._refresh_state()
 
     def _set_agent_released(self, agent_id: str, released: bool) -> None:
         """Release a specific Agent back to the native Windows taskbar, or reclaim it into the dock."""
-        target = None
-        for a in self.config.get("agents", []):
-            if a.get("id") == agent_id:
-                target = a
-                break
-        if target is None:
+        agents = list(self.config["agents"])
+        for index, agent in enumerate(agents):
+            if agent.get("id") != agent_id:
+                continue
+            was_released = agent.get("hide_from_taskbar", True) is False
+            if was_released != released:
+                agents[index] = {**agent, "hide_from_taskbar": not released}
+                if self._persist_config(agents=agents):
+                    self._refresh_state()
             return
-
-        new_hide = not released
-        if (target.get("hide_from_taskbar", True) is not False) == new_hide:
-            return
-
-        target["hide_from_taskbar"] = new_hide
-        self._persist_config()
-
-        self._refresh_state()
 
     def _reclaim_all_released(self) -> None:
-        changed = False
-        for a in self.config.get("agents", []):
-            if a.get("hide_from_taskbar", True) is False:
-                a["hide_from_taskbar"] = True
-                changed = True
-        if not changed:
-            return
-        self._persist_config()
-        self._refresh_state()
+        previous = self.config["agents"]
+        agents = [
+            {**agent, "hide_from_taskbar": True} if agent.get("hide_from_taskbar") is False else agent
+            for agent in previous
+        ]
+        if agents != previous and self._persist_config(agents=agents):
+            self._refresh_state()
 
     def _toggle_focus_existing(self, checked: bool) -> None:
-        self.config["ui"]["focus_existing"] = bool(checked)
-        self._persist_config()
+        self._persist_config(ui={"focus_existing": bool(checked)})
 
     def _clear_all_notifications(self) -> None:
         for agent in self.config.get("agents", []):
@@ -2215,22 +2755,31 @@ class AgentDockWindow(QWidget):
             self._notif_tracker.clear_agent(aid, [w["hwnd"] for w in wins])
         self._refresh_state()
 
-    def _reload_all(self) -> None:
+    def _reload_all(
+        self,
+        _checked: bool = False,
+        *,
+        force_refresh_icons: bool = True,
+        silent: bool = False,
+    ) -> None:
         try:
             new_cfg = load_config()
         except ConfigLoadError as exc:
-            QMessageBox.warning(
-                self,
-                "AI docker 配置加载失败",
-                f"agents.json 解析失败，已保留当前配置：\n{exc}",
-            )
+            if not silent:
+                QMessageBox.warning(
+                    self,
+                    "AI docker 配置加载失败",
+                    f"agents.json 解析失败，已保留当前配置：\n{exc}",
+                )
             return
+        anchor = self._anchor_for_current_pos()
         self.config = new_cfg
-        top_left = self.pos()
+        if not self._collapsed:
+            self._collapsed_anchor = anchor
         self._apply_styles()
-        self._rebuild_dock(force_refresh_icons=True)
-        self._reposition_after_rebuild(top_left)
+        self._rebuild_dock(force_refresh_icons=force_refresh_icons)
         self._refresh_state()
+        self._reposition_after_rebuild(anchor)
         if not self._auto_collapse_enabled():
             self._cancel_auto_collapse()
             self._expand_dock()
@@ -2273,7 +2822,7 @@ class AgentDockWindow(QWidget):
         try:
             dlg = UpdateDialog(result, theme=self._theme(), parent=self)
             if dlg.exec():
-                ok, detail = launch_updater_script(wait_pid=os.getpid(), gui_mode=True)
+                ok, detail = launch_updater_script(wait_pid=os.getpid(), gui_mode=True, update=result)
                 if ok:
                     should_quit = True
                 else:
@@ -2295,6 +2844,7 @@ class AgentDockWindow(QWidget):
             QMessageBox.warning(self, "开机自启设置失败", str(exc))
 
     def _cleanup_resources(self) -> None:
+        self._closing = True
         atexit.unregister(self._cleanup_resources)
         self._web_icons.invalidate()
         self._updater.invalidate()
@@ -2304,6 +2854,8 @@ class AgentDockWindow(QWidget):
             self._collapse_timer.stop()
         if hasattr(self, "_status_timer"):
             self._status_timer.stop()
+        if self._cached_hwnd:
+            user32.RemovePropW(self._cached_hwnd, _INSTALL_PROPERTY)
         if self._shellhook_registered and self._cached_hwnd:
             try:
                 user32.DeregisterShellHookWindow(wintypes.HWND(self._cached_hwnd))
@@ -2327,6 +2879,7 @@ class AgentDockWindow(QWidget):
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
             self._cancel_auto_collapse()
+            self._drag_origin = self.pos()
             self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
             event.accept()
             return
@@ -2342,8 +2895,39 @@ class AgentDockWindow(QWidget):
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.LeftButton and self._drag_offset is not None:
             self._drag_offset = None
-            self._collapsed_anchor = self.pos()
-            self._save_position()
+            origin = self._drag_origin
+            self._drag_origin = None
+            if origin is not None and self.pos() == origin:
+                self._schedule_auto_collapse()
+                event.accept()
+                return
+            prev_anchor = self._collapsed_anchor
+            prev_mirrored = self._vertical_mirrored
+            anchor = self._anchor_for_current_pos()
+            flipped = False
+            if self._is_vertical() and not self._collapsed:
+                should_mirror = self._vertical_mirror_right(anchor)
+                if should_mirror != self._vertical_mirrored:
+                    flipped = True
+                    self._collapsed_anchor = anchor
+                    self._apply_layout_orientation(mirror_right=should_mirror)
+                    self._last_shelf_sig = None
+                    self._refresh_state()
+                    self.adjustSize()
+                    self.move(self._expanded_pos_for_anchor(anchor))
+                    anchor = self._anchor_for_current_pos()
+            if self._save_position(anchor):
+                self._collapsed_anchor = anchor
+            else:
+                self._collapsed_anchor = prev_anchor
+                if flipped:
+                    self._apply_layout_orientation(mirror_right=prev_mirrored)
+                    self._last_shelf_sig = None
+                    self._refresh_state()
+                    self._root_layout.activate()
+                    self.adjustSize()
+                if origin is not None:
+                    self.move(origin)
             self._schedule_auto_collapse()
             event.accept()
             return

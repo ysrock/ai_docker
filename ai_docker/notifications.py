@@ -7,7 +7,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from itertools import count
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 WPN_DB_PATH = (
     Path(os.environ.get("LOCALAPPDATA", ""))
@@ -25,6 +25,7 @@ class WindowNotificationState:
     count: int = 0
     flashing: bool = False
     latest_text: str = ""
+    latest_event_order: int = 0
 
     @property
     def has_alert(self) -> bool:
@@ -38,6 +39,19 @@ class AgentNotificationSummary:
     latest_text: str = ""
     by_hwnd: dict[int, WindowNotificationState] = field(default_factory=dict)
     latest_event_order: int = 0
+
+    @property
+    def alert_hwnds_by_recency(self) -> list[int]:
+        """Return alerting window HWNDs ordered from most recent alert to oldest."""
+        return [
+            hwnd
+            for hwnd, state in sorted(
+                self.by_hwnd.items(),
+                key=lambda item: (item[1].latest_event_order, item[0]),
+                reverse=True,
+            )
+            if state.has_alert
+        ]
 
 
 @dataclass(frozen=True)
@@ -109,6 +123,7 @@ class NotificationTracker:
         self._dismissed_title_counts: dict[int, int] = {}
         self._badge_alerts: dict[str, tuple[int, int]] = {}
         self._dismissed_badge_counts: dict[str, int] = {}
+        self._foreground_hwnd = 0
 
     def _connect_ro(self) -> sqlite3.Connection | None:
         if not self._db_path.exists():
@@ -133,8 +148,33 @@ class NotificationTracker:
             conn.close()
 
     def on_shell_flash(self, hwnd: int, foreground_hwnd: int = 0) -> None:
-        if hwnd and hwnd != foreground_hwnd and hwnd not in self._flashing_hwnds:
+        if hwnd and hwnd != foreground_hwnd:
             self._flashing_hwnds[hwnd] = next(self._event_orders)
+
+    def _window_alert_info(self, hwnd: int) -> tuple[int, int, str, bool]:
+        title_count, title_order = self._title_alerts.get(hwnd, (0, 0))
+        if self._dismissed_title_counts.get(hwnd) == title_count:
+            title_count = title_order = 0
+        toast = self._window_toasts.get(hwnd, _NO_TOAST)
+        flash_order = self._flashing_hwnds.get(hwnd, 0)
+        count = max(title_count, toast.count)
+        order = max(title_order, toast.order, flash_order)
+        return count, order, toast.text, bool(flash_order)
+
+    def get_alert_hwnds(self, hwnds: Iterable[int] | None = None) -> list[int]:
+        """Return alerting HWNDs ordered from most recent alert to oldest."""
+        candidates = (
+            set(hwnds)
+            if hwnds is not None
+            else (self._flashing_hwnds.keys() | self._window_toasts.keys() | self._title_alerts.keys())
+        )
+        ranked: list[tuple[int, int]] = []
+        for hwnd in candidates:
+            count, order, _, flashing = self._window_alert_info(hwnd)
+            if count > 0 or flashing:
+                ranked.append((order, hwnd))
+        ranked.sort(reverse=True)
+        return [hwnd for _, hwnd in ranked]
 
     def clear_window(self, hwnd: int, agent_id: str | None = None) -> None:
         self._flashing_hwnds.pop(hwnd, None)
@@ -283,7 +323,9 @@ class NotificationTracker:
         # Title counters and badges are snapshots. Changes seen in the same poll share an order.
         snapshot_order = next(self._event_orders)
         live_hwnds: set[int] = set()
-        foreground_agents: set[str] = set()
+        sole_foreground_agents: set[str] = set()
+        focus_changed = foreground_hwnd != self._foreground_hwnd
+        self._foreground_hwnd = foreground_hwnd
         for aid, wins in agent_windows.items():
             for w in wins:
                 h = w["hwnd"]
@@ -304,7 +346,10 @@ class NotificationTracker:
 
                 if h == foreground_hwnd:
                     self.clear_window(h)
-                    foreground_agents.add(aid)
+                    if len(wins) == 1:
+                        sole_foreground_agents.add(aid)
+                    if focus_changed:
+                        self.clear_agent_unattributed(aid)
 
         for states in (self._flashing_hwnds, self._window_toasts, self._title_alerts, self._dismissed_title_counts):
             for h in states.keys() - live_hwnds:
@@ -324,7 +369,7 @@ class NotificationTracker:
                     del self._dismissed_badge_counts[aid]
                 elif cur_badge < dismissed_count:
                     self._dismissed_badge_counts[aid] = cur_badge
-        for aid in foreground_agents:
+        for aid in sole_foreground_agents:
             self.clear_agent_unattributed(aid)
 
         summaries: dict[str, AgentNotificationSummary] = {}
@@ -343,22 +388,19 @@ class NotificationTracker:
 
             for w in wins:
                 h = w["hwnd"]
-                title_count, title_order = self._title_alerts.get(h, (0, 0))
-                if self._dismissed_title_counts.get(h) == title_count:
-                    title_count = title_order = 0
-                toast = self._window_toasts.get(h, _NO_TOAST)
-                flash_order = self._flashing_hwnds.get(h, 0)
-                w_cnt = max(title_count, toast.count)
+                w_cnt, w_order, toast_text, is_flashing = self._window_alert_info(h)
 
-                if w_cnt > 0 or flash_order:
+                if w_cnt > 0 or is_flashing:
                     summary.by_hwnd[h] = WindowNotificationState(
                         count=w_cnt,
-                        flashing=bool(flash_order),
-                        latest_text=toast.text,
+                        flashing=is_flashing,
+                        latest_text=toast_text,
+                        latest_event_order=w_order,
                     )
                     win_total += w_cnt
-                    any_flash |= bool(flash_order)
-                    event_order = max(event_order, title_order, toast.order, flash_order)
+                    any_flash |= is_flashing
+                    event_order = max(event_order, w_order)
+                    toast = self._window_toasts.get(h, _NO_TOAST)
                     if toast.order > latest_toast.order:
                         latest_toast = toast
 
@@ -372,6 +414,9 @@ class NotificationTracker:
                 sole_h = wins[0]["hwnd"]
                 cur_state = summary.by_hwnd.get(sole_h, WindowNotificationState())
                 cur_state.count = max(cur_state.count, total)
+                cur_state.latest_event_order = max(
+                    cur_state.latest_event_order, agent_toast.order, badge_order
+                )
                 if latest_toast.text and not cur_state.latest_text:
                     cur_state.latest_text = latest_toast.text
                 summary.by_hwnd[sole_h] = cur_state

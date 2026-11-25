@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -25,7 +25,18 @@ from PySide6.QtWidgets import (
 
 from .discovery import build_agent_from_file, discover_new_agents, slugify_id
 from .icons import WebIconLoader, load_agent_icon
+from .launcher import _find_browser
 from .updater import UpdateCheckResult
+from .web_utils import (
+    detect_web_browser_matching,
+    normalize_web_url,
+    read_internet_shortcut_url,
+    suggest_web_agent_name,
+)
+
+
+def _detect_web_browser_matching() -> tuple[str, list[str]]:
+    return detect_web_browser_matching(_find_browser())
 
 
 def dialog_stylesheet(theme: str = "dark") -> str:
@@ -145,28 +156,36 @@ def dialog_stylesheet(theme: str = "dark") -> str:
 class AddAgentDialog(QDialog):
     """Apple-styled dialog to manually add a Desktop (.exe/.lnk), Web (URL), or CLI Agent."""
 
+    _TYPE_INDEX = {"exe": 0, "web": 1, "cli": 2}
+
     def __init__(
         self,
         existing_agents: list[dict[str, Any]],
         theme: str = "dark",
         parent: QWidget | None = None,
+        *,
+        initial_type: str = "exe",
+        initial_url: str = "",
     ) -> None:
         super().__init__(parent)
         self._existing = existing_agents
         self.created_agent: dict[str, Any] | None = None
 
-        self.setWindowTitle("添加新 Agent")
+        is_web_mode = initial_type == "web"
+        self.setWindowTitle("添加网页 Agent" if is_web_mode else "添加新 Agent")
         self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
-        self.setMinimumWidth(430)
+        self.setMinimumWidth(460)
         self.setStyleSheet(dialog_stylesheet(theme))
 
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 16, 18, 16)
         root.setSpacing(12)
 
-        title_lbl = QLabel("添加新 Agent 到悬浮窗")
+        title_lbl = QLabel("添加网页 Agent 到悬浮窗" if is_web_mode else "添加新 Agent 到悬浮窗")
         title_lbl.setStyleSheet("font-size: 15px; font-weight: 700;")
-        sub_lbl = QLabel("支持本地桌面程序、网页版或终端命令行；也可直接将 .exe / .lnk 拖到悬浮窗上。")
+        sub_lbl = QLabel(
+            "粘贴任意网页版 Agent 地址（支持带路径与参数），也可直接把浏览器地址栏链接或 .exe / .lnk / .url 拖到悬浮窗上。"
+        )
         sub_lbl.setObjectName("subLabel")
         sub_lbl.setWordWrap(True)
         root.addWidget(title_lbl)
@@ -181,7 +200,7 @@ class AddAgentDialog(QDialog):
         root.addLayout(type_row)
 
         self._name_edit = QLineEdit()
-        self._name_edit.setPlaceholderText("例如：Windsurf / DeepSeek / Aider")
+        self._name_edit.setPlaceholderText("例如：Windsurf / DeepSeek / Quick")
         name_form = QFormLayout()
         name_form.setContentsMargins(0, 0, 0, 0)
         name_form.addRow("显示名称", self._name_edit)
@@ -208,10 +227,17 @@ class AddAgentDialog(QDialog):
         f_web = QFormLayout(p_web)
         f_web.setContentsMargins(0, 0, 0, 0)
         self._url_edit = QLineEdit()
-        self._url_edit.setPlaceholderText("https://chat.deepseek.com")
-        self._app_mode_chk = QCheckBox("以 Chrome 独立应用窗口打开（推荐）")
+        self._url_edit.setPlaceholderText("https://chat.deepseek.com 或任意带路径的完整 URL")
+        self._url_edit.textChanged.connect(self._on_web_url_changed)
+        self._web_match_title_edit = QLineEdit()
+        self._web_match_title_edit.setPlaceholderText("可选：留空默认用显示名称，用于识别已打开的浏览器窗口")
+        self._web_icon_edit = QLineEdit()
+        self._web_icon_edit.setPlaceholderText("可选：留空自动获取站点图标，或填图标 URL / 本地路径")
+        self._app_mode_chk = QCheckBox("以独立应用窗口打开（推荐，自动适配 Chrome / Edge）")
         self._app_mode_chk.setChecked(True)
         f_web.addRow("网页地址", self._url_edit)
+        f_web.addRow("窗口关键字", self._web_match_title_edit)
+        f_web.addRow("图标来源", self._web_icon_edit)
         f_web.addRow("", self._app_mode_chk)
         self._stack.addWidget(p_web)
 
@@ -242,8 +268,33 @@ class AddAgentDialog(QDialog):
         btn_row.addWidget(ok_btn)
         root.addLayout(btn_row)
 
+        start_idx = self._TYPE_INDEX.get(initial_type, 0)
+        self._type_combo.setCurrentIndex(start_idx)
+        self._stack.setCurrentIndex(start_idx)
+
+        if start_idx == 1:
+            prefill = normalize_web_url(initial_url) if initial_url else None
+            if prefill is None:
+                cb = QApplication.clipboard()
+                if cb is not None:
+                    clip = cb.text().strip()
+                    if clip.lower().startswith(("http://", "https://")) and "\n" not in clip:
+                        prefill = normalize_web_url(clip)
+            if prefill:
+                self._url_edit.setText(prefill)
+                self._url_edit.selectAll()
+            self._url_edit.setFocus()
+
     def _on_type_changed(self, idx: int) -> None:
         self._stack.setCurrentIndex(idx)
+
+    def _on_web_url_changed(self, text: str) -> None:
+        normalized = normalize_web_url(text)
+        if not normalized:
+            return
+        suggested = suggest_web_agent_name(normalized)
+        self._name_edit.setPlaceholderText(f"留空默认：{suggested}")
+        self._web_match_title_edit.setPlaceholderText(f"可选：留空默认匹配「{suggested}」")
 
     def _browse_exe(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -276,26 +327,37 @@ class AddAgentDialog(QDialog):
             return
 
         if idx == 1:
-            url = self._url_edit.text().strip()
-            if not url:
+            raw_url = self._url_edit.text().strip()
+            if not raw_url:
                 QMessageBox.warning(self, "地址为空", "请输入网页地址。")
                 return
-            if not url.startswith(("http://", "https://")):
-                url = "https://" + url
-            host = urlparse(url).netloc or "web-agent"
-            name = custom_name or host.split(".")[0].capitalize()
-            self.created_agent = {
+            url = normalize_web_url(raw_url)
+            if not url:
+                QMessageBox.warning(
+                    self,
+                    "地址无效",
+                    "请输入有效的 http:// 或 https:// 网页地址。",
+                )
+                return
+            name = custom_name or suggest_web_agent_name(url)
+            match_title = self._web_match_title_edit.text().strip() or name
+            match_process, notif_handlers = _detect_web_browser_matching()
+            entry: dict[str, Any] = {
                 "id": slugify_id(name, existing_ids),
                 "name": name,
                 "type": "web",
                 "url": url,
                 "app_mode": self._app_mode_chk.isChecked(),
-                "match_process": "chrome.exe",
-                "match_title": name,
-                "notification_handlers": ["Chrome"],
-                "notification_keywords": [name.lower()],
+                "match_process": match_process,
+                "match_title": match_title,
+                "notification_handlers": notif_handlers,
+                "notification_keywords": [match_title.lower()],
                 "enabled": True,
             }
+            icon_src = self._web_icon_edit.text().strip()
+            if icon_src:
+                entry["icon_source"] = icon_src
+            self.created_agent = entry
             self.accept()
             return
 
@@ -438,7 +500,7 @@ class UpdateDialog(QDialog):
         header = QLabel(f"发现 {result.behind_count} 个新更新")
         header.setStyleSheet("font-size: 15px; font-weight: 700;")
         sub = QLabel(
-            f"当前分支 {result.branch} ({result.local_sha})  ->  最新 ({result.remote_sha})"
+            f"当前分支 {result.branch} ({result.local_sha[:12]})  ->  最新 ({result.remote_sha[:12]})"
         )
         sub.setObjectName("subLabel")
         root.addWidget(header)

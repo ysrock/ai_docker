@@ -5,10 +5,14 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import webbrowser
+from collections import OrderedDict
 from ctypes import wintypes
 from pathlib import Path
-from typing import Any
+from queue import Full, Queue
+from threading import Lock, Thread
+from typing import Any, Callable, Sequence
 
 import win32con
 import win32gui
@@ -100,6 +104,42 @@ def list_visible_windows() -> list[dict[str, Any]]:
 
 
 _last_focused_by_agent: dict[str, int] = {}
+
+
+def get_last_focused_hwnd(agent_id: str) -> int | None:
+    """Return the most recently focused window HWND recorded for an agent."""
+    return _last_focused_by_agent.get(agent_id)
+
+
+def select_target_window(
+    hwnds: Sequence[int],
+    *,
+    foreground_hwnd: int = 0,
+    last_focused_hwnd: int | None = None,
+    preferred_hwnds: Sequence[int] | None = None,
+    is_iconic: Callable[[int], bool] | None = None,
+) -> int:
+    """Select which open window to focus: newest alerting window first, else cycle."""
+    if not hwnds:
+        raise ValueError("hwnds must not be empty")
+    iconic = is_iconic if is_iconic is not None else (lambda h: bool(win32gui.IsIconic(h)))
+
+    if preferred_hwnds:
+        hwnd_set = set(hwnds)
+        for pref in preferred_hwnds:
+            if pref in hwnd_set and (pref != foreground_hwnd or iconic(pref)):
+                return pref
+
+    if len(hwnds) == 1:
+        return hwnds[0]
+
+    anchor = foreground_hwnd if foreground_hwnd in hwnds else last_focused_hwnd
+    if anchor in hwnds and not iconic(anchor):
+        idx = hwnds.index(anchor)
+        return hwnds[(idx + 1) % len(hwnds)]
+    if anchor in hwnds:
+        return anchor
+    return hwnds[0]
 
 _LEADING_BADGE_RE = re.compile(r"^\s*(?:[\(\[【]\s*\d+\s*[\)\]】]|[●•\*])\s*")
 _INVISIBLE_CHARS_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\ufeff]")
@@ -193,39 +233,85 @@ def extract_project_name(agent: dict[str, Any], raw_title: str) -> str:
     return candidate
 
 
-def _canonical_path(path_str: str) -> str:
-    """Normalize a Windows path, resolving junctions/symlinks/8.3 names when it exists."""
-    norm = os.path.normpath(path_str)
-    try:
-        if os.path.exists(norm):
-            norm = os.path.realpath(norm)
-    except OSError:
-        pass
-    return os.path.normcase(os.path.normpath(norm))
+class _ExecutablePathCache:
+    """Resolve filesystem aliases without blocking the GUI or holding up process exit."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._results: OrderedDict[str, tuple[float, str]] = OrderedDict()
+        self._requests: Queue[str] = Queue(maxsize=128)
+        self._pending: set[str] = set()
+        self._started = False
+
+    def get(self, path: str) -> str | None:
+        with self._lock:
+            cached = self._results.get(path)
+            if cached is not None and cached[0] > time.monotonic():
+                self._results.move_to_end(path)
+                return cached[1]
+            if path not in self._pending:
+                try:
+                    self._requests.put_nowait(path)
+                except Full:
+                    return None
+                self._pending.add(path)
+                if not self._started:
+                    self._started = True
+                    for _ in range(2):
+                        Thread(target=self._resolve, daemon=True).start()
+            return cached[1] if cached is not None else None
+
+    def _resolve(self) -> None:
+        while True:
+            path = self._requests.get()
+            try:
+                resolved = os.path.normcase(os.path.realpath(path))
+            except (OSError, ValueError):
+                resolved = path
+            with self._lock:
+                self._pending.remove(path)
+                self._results[path] = (time.monotonic() + 60, resolved)
+                self._results.move_to_end(path)
+                if len(self._results) > 256:
+                    self._results.popitem(last=False)
 
 
-def _matches_executable_path(exe_path: str, process_path: str) -> bool:
-    """Compare configured exe_path against a running window's process_path.
+_executable_paths = _ExecutablePathCache()
+_SQUIRREL_VERSION = re.compile(r"app-\d+(?:\.\d+){2,3}(?:[-+][a-z0-9][a-z0-9.+-]*)?", re.ASCII)
 
-    Handles junctions/symlinks/short paths and Squirrel versioned launchers
-    (e.g. App\\Foo.exe launching App\\app-1.2.3\\Foo.exe).
-    """
+
+def _executable_path_match(exe_path: str, process_path: str) -> int:
+    """Rank exact paths above Squirrel launchers and reject unrelated installs."""
     if not process_path:
-        return False
-    expected = _canonical_path(exe_path)
-    actual = _canonical_path(process_path)
+        return 0
+    expected = os.path.normcase(os.path.normpath(exe_path))
+    actual = os.path.normcase(os.path.normpath(process_path))
     if actual == expected:
-        return True
+        return 2
     exp_dir, exp_name = os.path.split(expected)
     act_dir, act_name = os.path.split(actual)
-    if act_name == exp_name:
-        parent_dir, sub_dir = os.path.split(act_dir)
-        if parent_dir == exp_dir and sub_dir.startswith("app-"):
-            return True
-    return False
+    parent_dir, sub_dir = os.path.split(act_dir)
+    versioned = act_name == exp_name and _SQUIRREL_VERSION.fullmatch(sub_dir) is not None
+    if versioned and parent_dir == exp_dir:
+        return 1
+    canonical_expected = _executable_paths.get(expected)
+    canonical_actual = _executable_paths.get(actual)
+    if canonical_expected is None or canonical_actual is None:
+        return 0
+    if canonical_expected == canonical_actual:
+        return 2
+    if versioned and os.path.dirname(os.path.dirname(canonical_actual)) == os.path.dirname(canonical_expected):
+        return 1
+    return 0
 
 
 def match_agent_windows(agent: dict[str, Any], windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [entry for entry, _ in _ranked_agent_windows(agent, windows)]
+
+
+def _ranked_agent_windows(
+    agent: dict[str, Any], windows: list[dict[str, Any]]
+) -> list[tuple[dict[str, Any], int]]:
     match_process = (agent.get("match_process") or "").strip().lower()
     match_title = (agent.get("match_title") or "").strip().lower()
     if not match_process and not match_title:
@@ -240,20 +326,21 @@ def match_agent_windows(agent: dict[str, Any], windows: list[dict[str, Any]]) ->
         and os.path.basename(exe_path).lower() == match_process
     )
 
-    matched: list[dict[str, Any]] = []
+    matched: list[tuple[dict[str, Any], int]] = []
     for w in windows:
         proc = w["process"].lower()
         title = w["title"].lower()
         if match_process and proc != match_process:
             continue
-        if use_match_path and not _matches_executable_path(exe_path, w.get("process_path") or ""):
-            continue
         if match_title and match_title not in title:
+            continue
+        rank = _executable_path_match(exe_path, w.get("process_path") or "") if use_match_path else 0
+        if use_match_path and not rank:
             continue
         entry = dict(w)
         entry["project"] = extract_project_name(agent, w["title"])
-        matched.append(entry)
-    matched.sort(key=lambda item: item["hwnd"])
+        matched.append((entry, rank))
+    matched.sort(key=lambda item: item[0]["hwnd"])
     return matched
 
 
@@ -264,16 +351,23 @@ def match_agent_window(agent: dict[str, Any], windows: list[dict[str, Any]]) -> 
 
 def get_agent_window_map(agents: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     windows = list_visible_windows()
-    mapping: dict[str, list[dict[str, Any]]] = {}
+    ranked: dict[str, list[tuple[dict[str, Any], int]]] = {}
+    exact_hwnds: set[int] = set()
     for agent in agents:
         if agent.get("enabled", True) is False:
             continue
         aid = agent.get("id")
         if not aid:
             continue
-        matched = match_agent_windows(agent, windows)
+        matched = _ranked_agent_windows(agent, windows)
         if matched:
-            mapping[aid] = matched
+            ranked[aid] = matched
+            exact_hwnds.update(entry["hwnd"] for entry, rank in matched if rank == 2)
+    mapping = {}
+    for aid, matched in ranked.items():
+        selected = [entry for entry, rank in matched if rank != 1 or entry["hwnd"] not in exact_hwnds]
+        if selected:
+            mapping[aid] = selected
     return mapping
 
 
@@ -330,6 +424,17 @@ def focus_hwnd(hwnd: int) -> bool:
         return False
 
 
+def close_hwnd(hwnd: int) -> bool:
+    """Politely ask a top-level window to close via asynchronous WM_CLOSE."""
+    if not hwnd or not win32gui.IsWindow(hwnd):
+        return False
+    try:
+        win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+        return True
+    except Exception:
+        return False
+
+
 def _find_browser(preferred: str | None = None) -> str | None:
     if preferred and Path(preferred).exists():
         return preferred
@@ -357,7 +462,7 @@ _VSCODE_NEW_WINDOW_EXES = {
 
 
 def _build_exe_launch_args(agent: dict[str, Any], force_new: bool) -> list[str]:
-    args = [str(a) for a in agent.get("args", [])]
+    args = [str(a) for a in agent.get("args") or []]
     if not force_new:
         return args
     extra = agent.get("new_instance_args")
@@ -369,24 +474,28 @@ def _build_exe_launch_args(agent: dict[str, Any], force_new: bool) -> list[str]:
     return args
 
 
-def launch_agent(agent: dict[str, Any], focus_existing: bool = True) -> tuple[bool, str]:
-    """Focus existing window(s) (cycling when multiple) if enabled and found, otherwise launch."""
+def launch_agent(
+    agent: dict[str, Any],
+    focus_existing: bool = True,
+    *,
+    agents: list[dict[str, Any]] | None = None,
+    preferred_hwnds: Sequence[int] | None = None,
+) -> tuple[bool, str]:
+    """Focus existing window(s) (preferring alerting windows, else cycling) if enabled, otherwise launch."""
     if focus_existing:
-        windows = list_visible_windows()
-        matched = match_agent_windows(agent, windows)
+        if agents is None or not agent.get("id"):
+            matched = match_agent_windows(agent, list_visible_windows())
+        else:
+            matched = get_agent_window_map(agents).get(agent.get("id", ""), [])
         if matched:
             hwnds = [w["hwnd"] for w in matched]
             aid = agent.get("id") or agent.get("name") or ""
-            target_hwnd = hwnds[0]
-            if len(hwnds) > 1:
-                fg_hwnd = win32gui.GetForegroundWindow()
-                last_hwnd = _last_focused_by_agent.get(aid)
-                anchor = fg_hwnd if fg_hwnd in hwnds else last_hwnd
-                if anchor in hwnds and not win32gui.IsIconic(anchor):
-                    idx = hwnds.index(anchor)
-                    target_hwnd = hwnds[(idx + 1) % len(hwnds)]
-                elif anchor in hwnds:
-                    target_hwnd = anchor
+            target_hwnd = select_target_window(
+                hwnds,
+                foreground_hwnd=win32gui.GetForegroundWindow(),
+                last_focused_hwnd=_last_focused_by_agent.get(aid),
+                preferred_hwnds=preferred_hwnds,
+            )
             if focus_hwnd(target_hwnd):
                 _last_focused_by_agent[aid] = target_hwnd
                 return True, f"focused:{agent.get('name', '')}"

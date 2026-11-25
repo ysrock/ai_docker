@@ -6,6 +6,8 @@ import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Event
+from uuid import uuid4
 
 from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal, Slot
 
@@ -56,56 +58,62 @@ def _run_git(repo_root: Path, *args: str, timeout: float = GIT_TIMEOUT_SEC) -> t
         return -3, "", str(exc)
 
 
-def _resolve_upstream(repo_root: Path, branch: str) -> tuple[str, str, str]:
-    """Return (remote_name, remote_branch, remote_ref) preferring configured @{u}."""
-    rc, upstream, _ = _run_git(
-        repo_root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"
-    )
-    if rc == 0 and "/" in upstream:
-        remote_name, remote_branch = upstream.split("/", 1)
-        if remote_name and remote_branch:
-            return remote_name, remote_branch, upstream
-    return "origin", branch, f"origin/{branch}"
-
-
-def check_for_updates(repo_root: Path = PROJECT_ROOT) -> UpdateCheckResult:
+def check_for_updates(repo_root: Path = PROJECT_ROOT, *, cancelled: Event | None = None) -> UpdateCheckResult:
     """Fetch remote branch metadata and compare local HEAD against its upstream."""
+    def git(*args: str, timeout: float = GIT_TIMEOUT_SEC) -> tuple[int, str, str]:
+        if cancelled is not None and cancelled.is_set():
+            return -1, "", "已取消检查更新。"
+        return _run_git(repo_root, *args, timeout=timeout)
+
     if not shutil.which("git"):
         return UpdateCheckResult(
             status="error",
             message="本机未安装 Git，无法自动检查 Git 仓库更新。",
         )
 
-    rc, inside, _ = _run_git(repo_root, "rev-parse", "--is-inside-work-tree")
-    if rc != 0 or inside.lower() != "true":
+    rc, worktree_root, _ = git("rev-parse", "--show-toplevel")
+    if rc != 0 or not worktree_root or Path(worktree_root).resolve() != repo_root.resolve():
         return UpdateCheckResult(
             status="not_git",
             message="当前目录不是 Git 克隆仓库，请通过 git clone 安装以启用一键更新。",
         )
 
-    rc, branch, err = _run_git(repo_root, "rev-parse", "--abbrev-ref", "HEAD")
+    rc, branch, err = git("symbolic-ref", "--quiet", "--short", "HEAD")
     if rc != 0 or not branch or branch == "HEAD":
         return UpdateCheckResult(
             status="error",
             message=f"当前处于游离 HEAD 状态，无法自动确定跟踪分支。{err}",
         )
 
-    rc, local_sha, _ = _run_git(repo_root, "rev-parse", "--short", "HEAD")
+    rc, local_sha, err = git("rev-parse", "--verify", "HEAD")
     if rc != 0:
-        local_sha = ""
+        return UpdateCheckResult(status="error", branch=branch, message=err or "无法读取当前提交。")
 
-    remote_name, remote_branch, remote_ref = _resolve_upstream(repo_root, branch)
-    rc, _, err = _run_git(repo_root, "fetch", "--quiet", remote_name, remote_branch, timeout=12.0)
+    rc, upstream, err = git(
+        "for-each-ref", "--format=%(upstream:remotename)%09%(upstream:remoteref)", f"refs/heads/{branch}"
+    )
     if rc != 0:
-        return UpdateCheckResult(
-            status="error",
-            local_sha=local_sha,
-            branch=branch,
-            remote_ref=remote_ref,
-            message=err or "拉取远端更新信息失败，请检查网络连接。",
+        return UpdateCheckResult(status="error", branch=branch, message=err or "无法读取上游分支。")
+    remote_name, _, remote_branch = upstream.partition("\t")
+    if not remote_name or not remote_branch:
+        remote_name, remote_branch = "origin", f"refs/heads/{branch}"
+    remote_ref = f"{remote_name}/{remote_branch.removeprefix('refs/heads/')}"
+
+    # Fetch into a private ref so concurrent Git operations cannot change the preview.
+    target_ref = f"refs/ai-docker/check-{uuid4().hex}"
+    try:
+        rc, _, err = git(
+            "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
+            remote_name, f"{remote_branch}:{target_ref}", timeout=12.0,
         )
-
-    rc, remote_sha, err = _run_git(repo_root, "rev-parse", "--short", remote_ref)
+        if rc != 0:
+            return UpdateCheckResult(
+                status="error", local_sha=local_sha, branch=branch, remote_ref=remote_ref,
+                message=err or "拉取远端更新信息失败，请检查网络连接。",
+            )
+        rc, remote_sha, err = git("rev-parse", "--verify", f"{target_ref}^{{commit}}")
+    finally:
+        _run_git(repo_root, "update-ref", "-d", target_ref, timeout=2.0)
     if rc != 0:
         return UpdateCheckResult(
             status="error",
@@ -115,9 +123,7 @@ def check_for_updates(repo_root: Path = PROJECT_ROOT) -> UpdateCheckResult:
             message=err or f"远端分支 {remote_ref} 不存在。",
         )
 
-    rc, counts_out, err = _run_git(
-        repo_root, "rev-list", "--left-right", "--count", f"HEAD...{remote_ref}"
-    )
+    rc, counts_out, err = git("rev-list", "--left-right", "--count", f"{local_sha}...{remote_sha}")
     if rc != 0:
         return UpdateCheckResult(
             status="error",
@@ -138,8 +144,10 @@ def check_for_updates(repo_root: Path = PROJECT_ROOT) -> UpdateCheckResult:
         except ValueError:
             ahead_count = behind_count = 0
 
-    rc_dirty, dirty_out, _ = _run_git(repo_root, "status", "--porcelain", "--untracked-files=no")
-    has_local_changes = rc_dirty == 0 and bool(dirty_out)
+    rc_dirty, dirty_out, dirty_error = git("status", "--porcelain", "--untracked-files=no")
+    if rc_dirty != 0:
+        return UpdateCheckResult(status="error", branch=branch, message=dirty_error or "无法检查工作区状态。")
+    has_local_changes = bool(dirty_out)
 
     if behind_count <= 0:
         return UpdateCheckResult(
@@ -151,12 +159,10 @@ def check_for_updates(repo_root: Path = PROJECT_ROOT) -> UpdateCheckResult:
             behind_count=0,
             ahead_count=ahead_count,
             has_local_changes=has_local_changes,
-            message=f"当前已是最新版本（{branch} @ {local_sha}）。",
+            message=f"当前已是最新版本（{branch} @ {local_sha[:12]}）。",
         )
 
-    _, log_out, _ = _run_git(
-        repo_root, "log", "--pretty=format:%h %s", "-n", "15", f"HEAD..{remote_ref}"
-    )
+    _, log_out, _ = git("log", "--pretty=format:%h %s", "-n", "15", f"{local_sha}..{remote_sha}")
     commits = tuple(line.strip() for line in log_out.splitlines() if line.strip())
 
     return UpdateCheckResult(
@@ -169,7 +175,7 @@ def check_for_updates(repo_root: Path = PROJECT_ROOT) -> UpdateCheckResult:
         ahead_count=ahead_count,
         commits=commits,
         has_local_changes=has_local_changes,
-        message=f"发现 {behind_count} 个新提交（{local_sha} -> {remote_sha}）。",
+        message=f"发现 {behind_count} 个新提交（{local_sha[:12]} -> {remote_sha[:12]}）。",
     )
 
 
@@ -177,8 +183,12 @@ def launch_updater_script(
     wait_pid: int | None = None,
     repo_root: Path = PROJECT_ROOT,
     gui_mode: bool = True,
+    *,
+    update: UpdateCheckResult | None = None,
 ) -> tuple[bool, str]:
     """Spawn detached update.ps1 to gracefully update and relaunch AI docker."""
+    if gui_mode and update is None:
+        return False, "缺少已确认的更新预览，请重新检查更新。"
     script = repo_root / "update.ps1"
     if not script.exists():
         return False, f"找不到更新脚本：{script}"
@@ -196,12 +206,15 @@ def launch_updater_script(
         cmd.extend(["-WaitPid", str(int(wait_pid))])
     if gui_mode:
         cmd.append("-GuiMode")
+    if update is not None:
+        cmd.extend([
+            "-PreviewBranch", update.branch,
+            "-LocalRevision", update.local_sha,
+            "-TargetRevision", update.remote_sha,
+        ])
 
-    creationflags = (
-        subprocess.DETACHED_PROCESS
-        | subprocess.CREATE_NEW_PROCESS_GROUP
-        | CREATE_NO_WINDOW
-    )
+    # DETACHED_PROCESS can make PowerShell exit before executing -File.
+    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
     try:
         subprocess.Popen(cmd, cwd=str(repo_root), creationflags=creationflags)
         return True, str(script)
@@ -215,17 +228,22 @@ class _UpdateCheckRunnable(QRunnable):
         repo_root: Path,
         generation: int,
         silent: bool,
+        cancelled: Event,
         complete: Callable[[int, UpdateCheckResult, bool], None],
     ) -> None:
         super().__init__()
         self._repo_root = repo_root
         self._generation = generation
         self._silent = silent
+        self._cancelled = cancelled
         self._complete = complete
 
     def run(self) -> None:
         try:
-            result = check_for_updates(self._repo_root)
+            if self._cancelled.is_set():
+                result = UpdateCheckResult(status="error")
+            else:
+                result = check_for_updates(self._repo_root, cancelled=self._cancelled)
         except Exception as exc:
             result = UpdateCheckResult(status="error", message=str(exc))
         try:
@@ -244,6 +262,7 @@ class UpdateChecker(QObject):
         super().__init__(parent)
         self._repo_root = repo_root
         self._generation = 0
+        self._cancelled = Event()
         self._in_flight = False
         self._pending_non_silent = False
         self._completed.connect(self._deliver, Qt.ConnectionType.QueuedConnection)
@@ -253,6 +272,8 @@ class UpdateChecker(QObject):
         return self._in_flight
 
     def invalidate(self) -> None:
+        self._cancelled.set()
+        self._cancelled = Event()
         self._generation += 1
         self._pending_non_silent = False
 
@@ -264,7 +285,7 @@ class UpdateChecker(QObject):
         self._in_flight = True
         self._pending_non_silent = False
         task = _UpdateCheckRunnable(
-            self._repo_root, self._generation, silent, self._completed.emit
+            self._repo_root, self._generation, silent, self._cancelled, self._completed.emit
         )
         QThreadPool.globalInstance().start(task)
         return True

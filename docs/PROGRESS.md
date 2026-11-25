@@ -81,6 +81,32 @@
   - 新增 `UpdateDialog`（`ai_docker/dialogs.py`）展示待拉取的提交日志并拦截未提交源码修改；用户点击“一键更新并重启”后拉起独立分离的 `update.ps1` 并优雅退出当前实例（先还原任务栏图标），随后快进拉取（`git pull --ff-only`，完整保留本地 `agents.json`）、按需 `uv sync` 与重编 `AI docker.exe` 并自动重启。
   - 在 `tests/test_regressions.py` 新增真实本地裸仓库 + `update.ps1` 端到端回归用例与弹窗/菜单联动测试（累计 13 项测试全部通过）。
   - 审查加固更新器与菜单细节：`update.ps1` 改为 UTF-8 BOM 兼容 Windows PowerShell 5.1、改用 Win32 `FindWindowW` + `WM_CLOSE` 优雅关闭 `Qt.Tool` 窗口、统一 `Invoke-Native` 避免 `uv sync` stderr 误报、GUI 更新失败自动恢复拉起旧实例；`updater.py` 注入 `GIT_TERMINAL_PROMPT=0`、识别 `@{u}` 真实上游与 `ahead_count` 分叉拦截；点击检查更新始终重新拉取避免过期缓存；`AppleGlassMenu` 按是否有勾选栏/子菜单动态对称留白并对动态名称中的 `&` 做转义。
+- **独立添加网页 Agent 入口与 URL 拖拽支持**：
+  - 在全局右键菜单 `Agent 管理` 下新增独立入口 **“添加网页 Agent (URL)...”**，点击直接进入网页添加页并自动读取剪贴板中的 `http(s)` 网址预填。
+  - 升级 `AddAgentDialog`（`ai_docker/dialogs.py`）：完整保留带路径与查询参数的 URL，智能提取显示名（自动跳过 `www`/`chat`/`app` 等通用前缀），新增可选的“窗口关键字”与“图标来源”字段，并自动检测本机 Chrome / Edge 匹配进程与通知通道。
+  - 升级 `AgentDockWindow` 拖放处理（`ai_docker/dock_window.py`）：除 `.exe`/`.lnk` 外，新增支持直接拖入浏览器地址栏链接或 Windows `.url` 快捷方式自动弹出预填好的网页 Agent 添加弹窗。
+- **面向 AI Agent 与自动化的 CLI 接口 + Win32 热重载 IPC**：
+  - 新增零 Qt 依赖的 `ai_docker/cli.py`、`ai_docker/__main__.py`、`ai-docker.cmd`、`ai_docker/ipc.py` 与 `ai_docker/web_utils.py`，并将 `validate_config()` 抽离至 `ai_docker/config.py` 供 GUI 与 CLI 共用校验。
+  - 提供 `schema` / `status` / `list` / `add (web|exe|cli|msix)` / `remove` / `show` / `hide` / `release` / `reclaim` / `move` / `open` / `discover` / `config (get|set)` / `dock (start|stop|reload|expand|collapse|clear-notifications)` / `update (check|apply)` 完整命令集，全命令支持 `--json` 结构化输出与 `--config` 隔离路径。
+  - 在 `AgentDockWindow.nativeEvent()` 接入 `AI_docker_CLI_Control` Win32 IPC 消息：CLI 修改配置后自动热通知正在运行的悬浮窗实时重载，无需重启且不与运行态配置冲突。
+  - 在 `tests/test_regressions.py` 新增 `CliTests` 与 `test_cli_ipc_controls_live_dock_window`（累计 19 项回归测试）。
+- **多窗口 Agent 点击优先跳转最新提醒窗口**：
+  - `ai_docker/notifications.py`：`WindowNotificationState` 新增 `latest_event_order`，`AgentNotificationSummary` 新增 `alert_hwnds_by_recency` 属性，`NotificationTracker` 新增 `_window_alert_info()` 与 `get_alert_hwnds()`，并调整 `on_shell_flash()` 在已有闪烁窗口再次闪烁时刷新事件顺序。
+  - `ai_docker/launcher.py`：抽离 `select_target_window()` 与 `get_last_focused_hwnd()`，为 `launch_agent()` 增加 `preferred_hwnds` 参数；存在多个运行窗口时优先跳转最新有提醒且未在前台（或已最小化）的窗口，全部提醒消标后恢复原有轮切顺序。
+  - `ai_docker/dock_window.py`：更新 `AgentDockWindow._on_agent_clicked()`，点击后仅精准清除实际跳转窗口的提醒与 Agent 级未归属提醒，保留其余窗口的未读提醒以便连续点击顺延查看。
+  - 在 `tests/test_regressions.py` 新增 `test_window_alert_recency_combines_toast_flash_and_title_and_refreshes_on_reflash` 与 `test_multi_window_agent_click_focuses_newest_alerting_window_first`（累计 21 项回归测试全部通过）。
+- **纵向布局（侧边图标栏 + 同行横向窗口铺开）**：
+  - `ai_docker/config.py` 与 `ai_docker/cli.py` 新增 `ui.orientation`（`horizontal` / `vertical`）配置校验与 CLI 支持。
+  - `ai_docker/dock_window.py`：改造 `DragGrip`、`AgentIconButton` 与 `TopDockCapsule` 支持横/纵双方向与巢状坐标计算；新增 `AgentHorizontalStrip` 在纵向模式下将同一 Agent 的多扇窗口紧邻对应图标横向铺开并按屏幕可用宽度自动折行（4-6 列），同时动态同步左侧图标槽位高度保证严格零错位。
+  - 停靠屏幕右半边时自动镜像为“图标在右、窗口条向左铺开”，并在全局菜单“显示与行为 -> 布局方向”支持一键切换，单 Agent 调整位置菜单同步适配上下移动文案。
+  - 在 `tests/test_regressions.py` 新增 `test_vertical_layout_aligns_window_strips_and_mirrors_on_right_edge` 与配置/CLI 方向校验（累计 22 项回归测试）。
+- **单窗口右键关闭与代码审查修复**：
+  - `ai_docker/launcher.py` 新增异步 `close_hwnd()`（基于 Win32 `PostMessage(..., WM_CLOSE, 0, 0)` 安全关闭指定窗口），并在 `ai_docker/dock_window.py` 窗口芯片右键菜单新增“关闭该窗口”红色警示项及失败提示。
+  - 修复审查发现的多处边界问题：`_reload_all()` 先取当前锚点再更新配置、`_set_orientation()` 与 `mouseReleaseEvent()` 同步更新锚点并在保存失败时完整回滚镜像布局、`_vertical_max_cols()` 下限调整为 `1` 避免窄屏溢屏、纵向槽位开启 `setMouseTracking(True)`、重建旧控件先隐藏脱离父级并清理未使用的 `hashlib` 导入。
+  - 同步更新 `docs/ARCHITECTURE.md` 并在 `tests/test_regressions.py` 新增 `test_window_context_menu_closes_window_and_preserves_other_alerts` 与 `test_vertical_reload_anchor_cross_screen_rollback_and_max_cols`（累计 24 项回归测试）。
+- **拖拽手柄双击一键收缩为悬浮图标**：
+  - `ai_docker/dock_window.py`：`DragGrip` 新增 `double_clicked` 信号及 `mouseDoubleClickEvent()` 响应，双击左侧/顶部拖拽点阵区立即调用 `_collapse_dock(force=True)` 收缩为单个悬浮图标（含 450ms 防弹回冷却并保持纵向靠右镜像锚点不偏移）；同时在 `mouseReleaseEvent()` 增加原地未移动判定跳过冗余配置写盘。
+  - 在 `tests/test_regressions.py` 新增 `test_drag_grip_double_click_collapses_to_orb_without_saving_config`（累计 25 项回归测试）。
 
 ## 后续规划
 - 支持自定义全局快捷键呼出/切换悬浮窗。

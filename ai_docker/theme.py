@@ -251,8 +251,8 @@ class AppleGlassMenu(QMenu):
                 y = float(rect.center().y()) + 0.5
                 painter.setPen(QPen(pal["divider"], 1.0))
                 painter.drawLine(
-                    QPointF(glass_rect.left() + 10.0, y),
-                    QPointF(glass_rect.right() - 10.0, y),
+                    QPointF(rect.left() + 5.0, y),
+                    QPointF(rect.right() - 5.0, y),
                 )
                 continue
 
@@ -260,12 +260,7 @@ class AppleGlassMenu(QMenu):
             selected = (act is active) and enabled
             destructive = bool(act.property("destructive"))
 
-            item_rect = QRectF(
-                glass_rect.left() + 5.0,
-                float(rect.top()) + 1.0,
-                glass_rect.width() - 10.0,
-                float(rect.height()) - 2.0,
-            )
+            item_rect = QRectF(rect).adjusted(0.0, 1.0, 0.0, -1.0)
 
             if selected:
                 hl_color = QColor(pal["alert"] if destructive else pal["accent"])

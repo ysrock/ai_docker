@@ -24,6 +24,7 @@ DEFAULT_UI: dict[str, Any] = {
     "window_chip_width": 138,
     "auto_collapse": True,
     "auto_collapse_seconds": 8,
+    "orientation": "horizontal",
 }
 
 
@@ -48,6 +49,10 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
     except (OSError, ValueError) as exc:
         raise ConfigLoadError(str(exc)) from exc
 
+    return validate_config(data)
+
+
+def validate_config(data: Any) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ConfigLoadError("配置文件根节点必须是 JSON 对象")
 
@@ -83,6 +88,13 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
         int(raw_collapse_sec)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ConfigLoadError("ui.auto_collapse_seconds 必须是有效整数") from exc
+    raw_orientation = ui.get("orientation", "horizontal")
+    if not isinstance(raw_orientation, str) or raw_orientation.strip().lower() not in (
+        "horizontal",
+        "vertical",
+    ):
+        raise ConfigLoadError("ui.orientation 仅支持 'horizontal' 或 'vertical'")
+    ui["orientation"] = raw_orientation.strip().lower()
     if ui["pos"] is not None:
         try:
             x, y = ui["pos"]
@@ -120,10 +132,12 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
             if agent.get(key) is not None and not isinstance(agent[key], str):
                 raise ConfigLoadError(f"agents[{index}].{key} 必须是字符串")
         for key in ("args", "new_instance_args"):
-            if agent.get(key) is not None:
-                values = agent[key]
-                if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
-                    raise ConfigLoadError(f"agents[{index}].{key} 必须是字符串数组")
+            values = agent.get(key)
+            if values is None:
+                continue
+            if not isinstance(values, list) or any(isinstance(value, (dict, list)) for value in values):
+                raise ConfigLoadError(f"agents[{index}].{key} 必须是由基本值组成的数组")
+            agent[key] = [str(value) for value in values]
         for key in ("notification_handlers", "notification_keywords"):
             values = agent.get(key, [])
             if not isinstance(values, list) or any(not isinstance(value, str) for value in values):

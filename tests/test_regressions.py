@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 from ai_docker.config import ConfigLoadError, load_config
 from ai_docker.notifications import NotificationTracker
-from ai_docker.updater import UpdateCheckResult, check_for_updates
+from ai_docker.updater import UpdateCheckResult, check_for_updates, launch_updater_script
 
 
 class NotificationTests(unittest.TestCase):
@@ -142,6 +142,62 @@ class NotificationTests(unittest.TestCase):
             s3 = tracker.poll(agents, windows, 20)["ide"]
             self.assertFalse(s3.has_alert)
 
+            with closing(sqlite3.connect(path)) as db, db:
+                db.execute("INSERT INTO Notification VALUES (4, 1, 'toast', '<toast><text>New general update</text></toast>')")
+            self.assertEqual(tracker.poll(agents, windows, 20)["ide"].total_count, 1)
+            self.assertEqual(tracker.poll(agents, windows, 0)["ide"].total_count, 1)
+
+    def test_window_alert_recency_combines_toast_flash_and_title_and_refreshes_on_reflash(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "wpn.sqlite"
+            with closing(sqlite3.connect(path)) as db, db:
+                db.executescript("""
+                    CREATE TABLE NotificationHandler(RecordId INT, PrimaryId TEXT);
+                    CREATE TABLE Notification(Id INT, HandlerId INT, Type TEXT, Payload TEXT);
+                    INSERT INTO NotificationHandler VALUES (1, 'ide');
+                    INSERT INTO Notification VALUES
+                    (1, 1, 'toast', '<toast><text>Alpha build finished</text></toast>');
+                """)
+            tracker = NotificationTracker(path)
+            agents = [{"id": "ide", "notification_handlers": ["ide"]}]
+            windows = {
+                "ide": [
+                    {"hwnd": 10, "project": "Alpha", "title": "Alpha - IDE"},
+                    {"hwnd": 20, "project": "Beta", "title": "Beta - IDE"},
+                    {"hwnd": 30, "project": "Gamma", "title": "Gamma - IDE"},
+                ]
+            }
+            # 1. Toast on Alpha (10) arrives first, then Beta (20) flashes, then Gamma (30) gets title count
+            with closing(sqlite3.connect(path)) as db, db:
+                db.execute("INSERT INTO Notification VALUES (2, 1, 'toast', '<toast><text>Alpha task ready</text></toast>')")
+            tracker.poll(agents, windows, 0)
+            tracker.on_shell_flash(20, foreground_hwnd=0)
+            windows["ide"][2]["title"] = "(2) Gamma - IDE"
+
+            summary = tracker.poll(agents, windows, 0)["ide"]
+            self.assertEqual(summary.alert_hwnds_by_recency, [30, 20, 10])
+            self.assertEqual(tracker.get_alert_hwnds(), [30, 20, 10])
+            self.assertLess(
+                summary.by_hwnd[10].latest_event_order,
+                summary.by_hwnd[20].latest_event_order,
+            )
+            self.assertLess(
+                summary.by_hwnd[20].latest_event_order,
+                summary.by_hwnd[30].latest_event_order,
+            )
+
+            # 2. Re-flashing an already alerting window (10) promotes it to newest
+            tracker.on_shell_flash(10, foreground_hwnd=0)
+            self.assertEqual(tracker.get_alert_hwnds(), [10, 30, 20])
+            summary = tracker.poll(agents, windows, 0)["ide"]
+            self.assertEqual(summary.alert_hwnds_by_recency, [10, 30, 20])
+
+            # 3. Clearing the newest window reveals the next newest alerting window
+            tracker.clear_window(10)
+            self.assertEqual(tracker.get_alert_hwnds(), [30, 20])
+            summary = tracker.poll(agents, windows, 0)["ide"]
+            self.assertEqual(summary.alert_hwnds_by_recency, [30, 20])
+
 
 class ConfigTests(unittest.TestCase):
     def test_config_rejects_bool_oversized_and_invalid_agent_fields(self):
@@ -152,6 +208,7 @@ class ConfigTests(unittest.TestCase):
             {"ui": {"button_size": 99999}, "agents": []},
             {"ui": {"opacity": True}, "agents": []},
             {"ui": {"auto_collapse_seconds": False}, "agents": []},
+            {"ui": {"orientation": "diagonal"}, "agents": []},
             {"ui": {"pos": [True, 10]}, "agents": []},
             {"ui": {}, "agents": [{"id": "a", "name": "A", "type": "exe", "args": "--bad"}]},
             {"ui": {}, "agents": [{"id": "a", "name": "A", "type": "cli", "command": 123}]},
@@ -167,19 +224,34 @@ class ConfigTests(unittest.TestCase):
             good.write_text(
                 json.dumps(
                     {
-                        "ui": {"icon_size": 32, "button_size": 46, "auto_collapse_seconds": 8, "pos": [100, 80]},
-                        "agents": [{"id": "code", "name": "VS Code", "type": "exe", "args": ["--reuse-window"]}],
+                        "ui": {
+                            "icon_size": 32,
+                            "button_size": 46,
+                            "auto_collapse_seconds": 8,
+                            "orientation": "VERTICAL",
+                            "pos": [100, 80],
+                        },
+                        "agents": [
+                            {"id": "code", "name": "VS Code", "type": "exe", "args": ["--reuse-window", 42]},
+                            {"id": "other", "type": "exe", "args": None},
+                        ],
                     }
                 ),
                 encoding="utf-8",
             )
             loaded = load_config(good)
             self.assertEqual(loaded["ui"]["icon_size"], 32)
-            self.assertEqual(loaded["agents"][0]["args"], ["--reuse-window"])
+            self.assertEqual(loaded["ui"]["orientation"], "vertical")
+            self.assertEqual(loaded["agents"][0]["args"], ["--reuse-window", "42"])
+            if sys.platform == "win32":
+                from ai_docker.launcher import _build_exe_launch_args
+
+                self.assertEqual(_build_exe_launch_args(loaded["agents"][1], force_new=False), [])
 
 
 class UpdaterTests(unittest.TestCase):
     def test_check_for_updates_and_update_ps1_preserves_local_config(self):
+        import os
         import shutil
         import subprocess
 
@@ -211,6 +283,7 @@ class UpdaterTests(unittest.TestCase):
 
             clone = root / "user_clone"
             run(["git", "clone", str(bare), str(clone)], root)
+            run(["git", "remote", "rename", "origin", "build/cache"], clone)
             local_cfg = clone / "agents.json"
             local_cfg.write_text('{"ui": {"theme": "light"}, "agents": []}', encoding="utf-8")
 
@@ -226,9 +299,15 @@ class UpdaterTests(unittest.TestCase):
 
             r1 = check_for_updates(clone)
             self.assertEqual(r1.status, "update_available")
+            self.assertEqual(r1.remote_ref, "build/cache/main")
             self.assertEqual(r1.behind_count, 1)
             self.assertFalse(r1.has_local_changes)
             self.assertTrue(any("feat: upgrade to v2" in c for c in r1.commits))
+
+            nested = clone / "standalone-copy"
+            nested.mkdir()
+            shutil.copy2(clone / "update.ps1", nested / "update.ps1")
+            self.assertEqual(check_for_updates(nested).status, "not_git")
 
             # Tracked local edit must be flagged
             (clone / "app.txt").write_text("local edit\n", encoding="utf-8")
@@ -244,16 +323,58 @@ class UpdaterTests(unittest.TestCase):
             )
             if sys.platform == "win32":
                 shell = shutil.which("powershell") or shutil.which("pwsh") or "powershell.exe"
-                proc = subprocess.run(
-                    [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(clone / "update.ps1"), "-NoLaunch"],
-                    cwd=str(clone),
-                    capture_output=True,
-                    text=True,
-                )
+
+                def run_update(directory, env=None, preview=None):
+                    args = ["-NoLaunch"]
+                    if preview is not None:
+                        args.extend([
+                            "-PreviewBranch", preview.branch,
+                            "-LocalRevision", preview.local_sha,
+                            "-TargetRevision", preview.remote_sha,
+                        ])
+                    return subprocess.run(
+                        [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(directory / "update.ps1"), *args],
+                        cwd=str(directory),
+                        capture_output=True,
+                        text=True,
+                        env=env,
+                        timeout=30,
+                    )
+
+                nested_update = run_update(nested)
+                self.assertNotEqual(nested_update.returncode, 0)
+                self.assertEqual((clone / "app.txt").read_text(encoding="utf-8").strip(), "v1")
+
+                proc = run_update(clone, preview=r1)
                 self.assertEqual(proc.returncode, 0, f"update.ps1 failed: {proc.stdout}\n{proc.stderr}")
                 self.assertEqual((clone / "app.txt").read_text(encoding="utf-8").strip(), "v2")
                 self.assertEqual(local_cfg.read_text(encoding="utf-8"), '{"ui": {"theme": "light"}, "agents": []}')
                 self.assertEqual(check_for_updates(clone).status, "up_to_date")
+
+                (upstream / "uv.lock").write_text("fixture\n", encoding="utf-8")
+                run(["git", "add", "uv.lock"], upstream)
+                run(["git", "commit", "-m", "change dependencies"], upstream)
+                run(["git", "push", "origin", "main"], upstream)
+                bin_dir = root / "bin"
+                bin_dir.mkdir()
+                (bin_dir / "uv.cmd").write_text(
+                    '@echo off\n'
+                    'echo %*>>"%~dp0calls.txt"\n'
+                    'if exist "%~dp0allow-sync" exit /b 0\n'
+                    'exit /b 42\n',
+                    encoding="ascii",
+                )
+                env = {**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]}
+                failed_sync = run_update(clone, env)
+                self.assertNotEqual(failed_sync.returncode, 0)
+                self.assertTrue((clone / "uv.lock").exists())
+                marker = clone / ".git" / "ai-docker-sync-pending"
+                self.assertTrue(marker.is_file())
+                (bin_dir / "allow-sync").touch()
+                retry = run_update(clone, env)
+                self.assertEqual(retry.returncode, 0, f"retry failed: {retry.stdout}\n{retry.stderr}")
+                self.assertEqual((bin_dir / "calls.txt").read_text().splitlines(), ["sync --locked", "sync --locked"])
+                self.assertFalse(marker.exists())
 
             # Diverged branch (local ahead + remote behind) must set ahead_count > 0 and can_fast_forward=False
             run(["git", "config", "user.email", "user@example.com"], clone)
@@ -270,9 +391,162 @@ class UpdaterTests(unittest.TestCase):
             self.assertEqual(r_div.behind_count, 1)
             self.assertFalse(r_div.can_fast_forward)
 
+            if sys.platform == "win32":
+                protected = root / "protected_clone"
+                run(["git", "clone", str(bare), str(protected)], root)
+                protected_cfg = protected / "agents.json"
+                protected_cfg.write_bytes(b'{"agents": []}\n')
+                protected_sha = run(["git", "rev-parse", "HEAD"], protected)
+                run(["git", "commit", "--allow-empty", "-m", "previewed update"], upstream)
+                run(["git", "push", "origin", "main"], upstream)
+                preview = check_for_updates(protected)
+                self.assertEqual(preview.status, "update_available")
+                run(["git", "commit", "--allow-empty", "-m", "published after preview"], upstream)
+                run(["git", "push", "origin", "main"], upstream)
+                stale_preview = run_update(protected, preview=preview)
+                self.assertNotEqual(stale_preview.returncode, 0)
+                self.assertEqual(run(["git", "rev-parse", "HEAD"], protected), protected_sha)
+
+                preview = check_for_updates(protected)
+                old_dock = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.25)"])
+                spawn = subprocess.Popen
+                workers = []
+
+                def track_worker(*args, **kwargs):
+                    process = spawn(*args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
+                    workers.append(process)
+                    return process
+
+                try:
+                    with patch("ai_docker.updater.subprocess.Popen", side_effect=track_worker):
+                        ok, message = launch_updater_script(
+                            wait_pid=old_dock.pid, repo_root=protected, gui_mode=False, update=preview
+                        )
+                    self.assertTrue(ok, message)
+                    self.assertEqual(workers[0].wait(timeout=20), 0)
+                finally:
+                    old_dock.wait(timeout=5)
+                    for worker in workers:
+                        if worker.poll() is None:
+                            worker.terminate()
+                            worker.wait(timeout=5)
+                protected_sha = run(["git", "rev-parse", "HEAD"], protected)
+                self.assertEqual(protected_sha, preview.remote_sha)
+                (upstream / "agents.json").write_bytes(b'{"agents": [null]}\n')
+                run(["git", "add", "-f", "agents.json"], upstream)
+                run(["git", "commit", "-m", "add conflicting config"], upstream)
+                run(["git", "push", "origin", "main"], upstream)
+                blocked = run_update(protected)
+                self.assertNotEqual(blocked.returncode, 0)
+                self.assertIn("agents.json", blocked.stdout + blocked.stderr)
+                self.assertEqual(run(["git", "rev-parse", "HEAD"], protected), protected_sha)
+                self.assertEqual(protected_cfg.read_bytes(), b'{"agents": []}\n')
+
 
 @unittest.skipUnless(sys.platform == "win32", "Windows integration")
 class WindowsTests(unittest.TestCase):
+    def test_shutdown_skips_queued_icon_and_update_jobs(self):
+        from PySide6.QtCore import QObject, QRunnable, QThreadPool
+        from PySide6.QtWidgets import QApplication
+
+        from ai_docker import icons, updater
+
+        app = QApplication.instance() or QApplication(["regressions", "-platform", "offscreen"])
+        pool = QThreadPool.globalInstance()
+        self.assertTrue(pool.waitForDone(3000))
+        thread_count = pool.maxThreadCount()
+        pool.setMaxThreadCount(1)
+        release = threading.Event()
+
+        class Blocker(QRunnable):
+            def run(self):
+                release.wait(4)
+
+        parent = QObject()
+        loader = icons.WebIconLoader(parent)
+        checker = updater.UpdateChecker(parent)
+        try:
+            with patch.object(icons, "fetch_web_icon_to_png") as fetch, patch.object(updater, "check_for_updates") as check:
+                pool.start(Blocker())
+                loader.resolve("https://fixture.invalid/")
+                checker.check_async()
+                loader.invalidate()
+                checker.invalidate()
+                release.set()
+                self.assertTrue(pool.waitForDone(3000))
+                app.processEvents()
+                fetch.assert_not_called()
+                check.assert_not_called()
+        finally:
+            release.set()
+            pool.waitForDone(3000)
+            pool.setMaxThreadCount(thread_count)
+
+    def test_failed_config_save_leaves_live_taskbar_unchanged(self):
+        from PySide6.QtWidgets import QApplication
+
+        from ai_docker import dock_window
+        from ai_docker.config import DEFAULT_UI
+
+        app = QApplication.instance() or QApplication(["regressions", "-platform", "offscreen"])
+        config = {"ui": dict(DEFAULT_UI), "agents": [{"id": "editor", "name": "Editor", "type": "exe"}]}
+        with (
+            patch.object(dock_window, "load_config", return_value=config),
+            patch.object(dock_window, "TaskbarHider"),
+            patch.object(dock_window, "NotificationTracker"),
+            patch.object(dock_window, "save_config", side_effect=OSError("fixture")) as save,
+            patch.object(dock_window.QMessageBox, "warning"),
+        ):
+            dock = dock_window.AgentDockWindow()
+            try:
+                with patch.object(dock, "_refresh_state") as refresh:
+                    dock._toggle_hide_from_taskbar(False)
+                    dock._set_agent_released("editor", True)
+                    self.assertIs(dock.config, config)
+                    self.assertNotIn("hide_from_taskbar", dock._buttons["editor"].agent)
+                    refresh.assert_not_called()
+                    dock._taskbar_hider.restore_all.assert_not_called()
+
+                    save.side_effect = None
+                    dock._toggle_hide_from_taskbar(False)
+                    self.assertFalse(dock.config["ui"]["hide_from_taskbar"])
+                    self.assertTrue(config["ui"]["hide_from_taskbar"])
+                    refresh.assert_called_once()
+                    dock._taskbar_hider.restore_all.assert_called_once()
+            finally:
+                dock.close()
+
+    def test_multicolumn_menu_highlight_stays_in_the_selected_column(self):
+        from PySide6.QtCore import QPoint
+        from PySide6.QtWidgets import QApplication
+
+        from ai_docker.theme import AppleGlassMenu
+
+        app = QApplication.instance() or QApplication(["regressions", "-platform", "offscreen"])
+        menu = AppleGlassMenu()
+        for index in range(90):
+            menu.addAction(f"Agent {index:02}").setCheckable(True)
+        try:
+            menu.popup(QPoint(0, 0))
+            app.processEvents()
+            first = menu.actionGeometry(menu.actions()[0])
+            selected = next(action for action in menu.actions() if menu.actionGeometry(action).left() > first.left())
+            second = menu.actionGeometry(selected)
+            menu.setActiveAction(None)
+            before = menu.grab()
+            menu.setActiveAction(selected)
+            after = menu.grab()
+
+            def color(pixmap, x, y):
+                ratio = pixmap.devicePixelRatio()
+                return pixmap.toImage().pixel(round(x * ratio), round(y * ratio))
+
+            y = second.center().y()
+            self.assertNotEqual(color(before, second.right() - 10, y), color(after, second.right() - 10, y))
+            self.assertEqual(color(before, first.right() - 10, y), color(after, first.right() - 10, y))
+        finally:
+            menu.close()
+
     def test_discovered_installations_match_distinct_process_paths(self):
         from ai_docker import discovery, launcher
 
@@ -314,6 +588,16 @@ class WindowsTests(unittest.TestCase):
             },
         ]
         self.assertEqual(launcher.match_agent_window(squirrel_agent, squirrel_windows), 11)
+
+        exact = {**squirrel_agent, "id": "exact", "path": squirrel_windows[0]["process_path"]}
+        with patch.object(launcher, "list_visible_windows", return_value=squirrel_windows):
+            self.assertEqual(set(launcher.get_agent_window_map([squirrel_agent, exact])), {"exact"})
+        unrelated = {**squirrel_windows[0], "process_path": r"C:\Apps\SquirrelApp\app-dev\SquirrelApp.exe"}
+        with patch.object(launcher._executable_paths, "get", return_value=None) as lookup:
+            self.assertIsNone(launcher.match_agent_window(squirrel_agent, [unrelated]))
+            lookup.reset_mock()
+            self.assertIsNone(launcher.match_agent_window({**squirrel_agent, "match_title": "absent"}, [unrelated]))
+            lookup.assert_not_called()
 
     def test_taskbar_only_restores_eligible_tracked_windows(self):
         import win32con as flags
@@ -375,7 +659,7 @@ class WindowsTests(unittest.TestCase):
             cached = Path(directory) / "web.png"
             Image.new("RGBA", (64, 64), "red").save(cached)
 
-            def fake_fetch(url, force):
+            def fake_fetch(url, force, *, cancelled=None):
                 calls.append((url, force, threading.get_ident()))
                 if not force:
                     worker_started.set()
@@ -668,3 +952,743 @@ class WindowsTests(unittest.TestCase):
             finally:
                 dock.close()
                 QThreadPool.globalInstance().waitForDone(3000)
+
+    def test_add_web_agent_entry_dialog_and_url_drop(self):
+        from PySide6.QtCore import QMimeData, QThreadPool, QUrl
+        from PySide6.QtWidgets import QApplication
+
+        from ai_docker import dialogs, dock_window
+        from ai_docker.config import DEFAULT_UI
+
+        app = QApplication.instance() or QApplication(["regressions", "-platform", "offscreen"])
+
+        # URL normalization & smart naming
+        sample_url = "https://quick.example.com/sn/account/000000/start/chat?conversationId=demo-123"
+        self.assertEqual(dialogs.normalize_web_url(sample_url), sample_url)
+        self.assertIsNone(dialogs.normalize_web_url("javascript:alert(1)"))
+        self.assertIsNone(dialogs.normalize_web_url("not a valid url"))
+        self.assertEqual(dialogs.suggest_web_agent_name(sample_url), "Quick")
+        self.assertEqual(dialogs.suggest_web_agent_name("https://chat.deepseek.com/"), "Deepseek")
+        self.assertEqual(dialogs.suggest_web_agent_name("https://www.kimi.com/"), "Kimi")
+
+        with TemporaryDirectory() as directory:
+            url_file = Path(directory) / "Quick.url"
+            url_file.write_text(f"[InternetShortcut]\nURL={sample_url}\n", encoding="utf-8")
+            self.assertEqual(dialogs.read_internet_shortcut_url(str(url_file)), sample_url)
+
+            # Dialog opens directly on web tab, preserves query params, and adapts to Edge
+            with patch.object(dialogs, "_find_browser", return_value=r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"):
+                dlg = dialogs.AddAgentDialog([], theme="light", initial_type="web", initial_url=sample_url)
+                self.assertEqual(dlg._type_combo.currentIndex(), 1)
+                self.assertEqual(dlg._url_edit.text(), sample_url)
+                dlg._web_match_title_edit.setText("Quick Chat")
+                dlg._web_icon_edit.setText("https://quick.example.com/logo.png")
+                dlg._on_submit()
+                created = dlg.created_agent
+                self.assertIsNotNone(created)
+                self.assertEqual(created["type"], "web")
+                self.assertEqual(created["url"], sample_url)
+                self.assertEqual(created["name"], "Quick")
+                self.assertEqual(created["match_process"], "msedge.exe")
+                self.assertEqual(created["notification_handlers"], ["MSEdge"])
+                self.assertEqual(created["match_title"], "Quick Chat")
+                self.assertEqual(created["icon_source"], "https://quick.example.com/logo.png")
+                dlg.deleteLater()
+
+            # Global menu exposes dedicated Web Agent entry & drop payload extracts browser URLs / .url files
+            config = {
+                "ui": {**DEFAULT_UI, "hide_from_taskbar": False, "auto_collapse": False},
+                "agents": [{"id": "a1", "name": "Agent 1", "type": "exe", "path": "", "match_process": "a1.exe"}],
+            }
+            with (
+                patch.object(dock_window, "load_config", return_value=config),
+                patch.object(dock_window, "TaskbarHider"),
+                patch.object(dock_window, "NotificationTracker"),
+                patch.object(dock_window, "get_agent_window_map", return_value={}),
+            ):
+                dock = dock_window.AgentDockWindow()
+                dock._status_timer.stop()
+                dock._startup_update_timer.stop()
+                try:
+                    gmenu = dock._build_global_menu()
+                    agent_act = next(a for a in gmenu.actions() if a.menu() is not None and a.text() == "Agent 管理")
+                    agent_items = [a.text() for a in agent_act.menu().actions() if not a.isSeparator()]
+                    self.assertIn("添加网页 Agent (URL)...", agent_items)
+                    gmenu.deleteLater()
+
+                    mime_web = QMimeData()
+                    mime_web.setUrls([QUrl(sample_url)])
+                    exes, dropped_url = dock._extract_drop_payload(mime_web)
+                    self.assertEqual(exes, [])
+                    self.assertEqual(dropped_url, sample_url)
+
+                    mime_shortcut = QMimeData()
+                    mime_shortcut.setUrls([QUrl.fromLocalFile(str(url_file))])
+                    exes2, dropped_url2 = dock._extract_drop_payload(mime_shortcut)
+                    self.assertEqual(exes2, [])
+                    self.assertEqual(dropped_url2, sample_url)
+                finally:
+                    dock.close()
+                    QThreadPool.globalInstance().waitForDone(3000)
+
+    def test_cli_ipc_controls_live_dock_window(self):
+        import ctypes
+        from ctypes import wintypes
+
+        import win32con
+        import win32gui
+        from PySide6.QtCore import QThreadPool
+        from PySide6.QtWidgets import QApplication
+
+        from ai_docker import dock_window, ipc
+        from ai_docker.config import DEFAULT_UI
+
+        # 1. Verify real Win32 property discovery + PostMessageW via native Win32 HWND
+        test_prop = "AI docker test IPC prop"
+        hwnd = win32gui.CreateWindowEx(
+            0, "Static", "AI docker IPC test", win32con.WS_POPUP, 0, 0, 20, 20, 0, 0, 0, None
+        )
+        self.addCleanup(win32gui.DestroyWindow, hwnd)
+        self.assertTrue(dock_window.user32.SetPropW(hwnd, test_prop, 1))
+        self.addCleanup(dock_window.user32.RemovePropW, hwnd, test_prop)
+        found = ipc.find_dock_window(test_prop)
+        self.assertIsNotNone(found)
+        self.assertEqual(found[0], hwnd)
+        self.assertTrue(ipc.send_dock_command(ipc.IPC_CMD_RELOAD, test_prop))
+
+        # 2. Verify AgentDockWindow.nativeEvent dispatches collapse / expand / silent reload
+        app = QApplication.instance() or QApplication(["regressions", "-platform", "offscreen"])
+        config = {
+            "ui": {**DEFAULT_UI, "hide_from_taskbar": False, "auto_collapse": False},
+            "agents": [{"id": "a1", "name": "Agent 1", "type": "exe", "path": "", "match_process": "a1.exe"}],
+        }
+        with (
+            patch.object(dock_window, "load_config", return_value=config),
+            patch.object(dock_window, "TaskbarHider"),
+            patch.object(dock_window, "NotificationTracker"),
+            patch.object(dock_window, "get_agent_window_map", return_value={}),
+        ):
+            dock = dock_window.AgentDockWindow()
+            dock._taskbar_hider.hidden_count = 0
+            dock._notif_tracker.poll.return_value = {}
+            dock._status_timer.stop()
+            dock._startup_update_timer.stop()
+            dock._ipc_msg = 0xC123
+
+            def dispatch_ipc(cmd: int) -> None:
+                msg = wintypes.MSG()
+                msg.message = dock._ipc_msg
+                msg.wParam = cmd
+                handled, _ = dock.nativeEvent(b"windows_generic_MSG", ctypes.addressof(msg))
+                self.assertTrue(handled)
+                app.processEvents()
+
+            try:
+                dispatch_ipc(ipc.IPC_CMD_COLLAPSE)
+                self.assertTrue(dock._collapsed)
+
+                dispatch_ipc(ipc.IPC_CMD_EXPAND)
+                self.assertFalse(dock._collapsed)
+
+                with patch.object(dock, "_reload_all") as mock_reload:
+                    dispatch_ipc(ipc.IPC_CMD_RELOAD)
+                    mock_reload.assert_called_once_with(force_refresh_icons=False, silent=True)
+            finally:
+                dock.close()
+                QThreadPool.globalInstance().waitForDone(3000)
+
+    def test_multi_window_agent_click_focuses_newest_alerting_window_first(self):
+        from PySide6.QtCore import QThreadPool
+        from PySide6.QtWidgets import QApplication
+
+        from ai_docker import dock_window, launcher
+        from ai_docker.config import DEFAULT_UI
+
+        # 1. Pure window-selection logic: preferred alerting order, closed fallback, foreground skip, cycling
+        self.assertEqual(
+            launcher.select_target_window(
+                [10, 20, 30],
+                foreground_hwnd=0,
+                preferred_hwnds=[30, 10],
+                is_iconic=lambda _h: False,
+            ),
+            30,
+        )
+        self.assertEqual(
+            launcher.select_target_window(
+                [10, 20, 30],
+                foreground_hwnd=30,
+                preferred_hwnds=[30, 10],
+                is_iconic=lambda _h: False,
+            ),
+            10,
+        )
+        self.assertEqual(
+            launcher.select_target_window(
+                [10, 20, 30],
+                foreground_hwnd=30,
+                preferred_hwnds=[30, 10],
+                is_iconic=lambda h: h == 30,
+            ),
+            30,
+        )
+        self.assertEqual(
+            launcher.select_target_window(
+                [10, 20, 30],
+                foreground_hwnd=10,
+                preferred_hwnds=[999],
+                is_iconic=lambda _h: False,
+            ),
+            20,
+        )
+
+        # 2. End-to-end click sequence through AgentDockWindow._on_agent_clicked
+        app = QApplication.instance() or QApplication(["regressions", "-platform", "offscreen"])
+        agent = {"id": "ide-multi", "name": "IDE Multi", "type": "exe", "path": "", "match_process": "ide.exe"}
+        config = {
+            "ui": {**DEFAULT_UI, "hide_from_taskbar": False, "auto_collapse": False, "focus_existing": True},
+            "agents": [agent],
+        }
+        win_list = [
+            {"hwnd": 10, "project": "P1", "title": "P1 - IDE"},
+            {"hwnd": 20, "project": "P2", "title": "P2 - IDE"},
+            {"hwnd": 30, "project": "P3", "title": "P3 - IDE"},
+        ]
+        focused_calls: list[int] = []
+        fg_state = {"hwnd": 0}
+
+        def fake_focus(hwnd: int) -> bool:
+            focused_calls.append(hwnd)
+            fg_state["hwnd"] = hwnd
+            return True
+
+        with TemporaryDirectory() as directory:
+            tracker = NotificationTracker(Path(directory) / "absent.sqlite")
+            with (
+                patch.object(dock_window, "load_config", return_value=config),
+                patch.object(dock_window, "TaskbarHider"),
+                patch.object(dock_window, "NotificationTracker", return_value=tracker),
+                patch.object(dock_window, "get_agent_window_map", return_value={"ide-multi": win_list}),
+                patch.object(launcher, "get_agent_window_map", return_value={"ide-multi": win_list}),
+                patch.object(launcher, "focus_hwnd", side_effect=fake_focus),
+                patch.object(launcher.win32gui, "GetForegroundWindow", side_effect=lambda: fg_state["hwnd"]),
+                patch.object(launcher.win32gui, "IsIconic", return_value=False),
+            ):
+                dock = dock_window.AgentDockWindow()
+                dock._taskbar_hider.hidden_count = 0
+                dock._status_timer.stop()
+                dock._startup_update_timer.stop()
+                try:
+                    # Window 10 alerts first, then Window 30 alerts later
+                    tracker.on_shell_flash(10, foreground_hwnd=0)
+                    tracker.on_shell_flash(30, foreground_hwnd=0)
+                    dock._refresh_state()
+
+                    # First click jumps to newest alerting window (30) and preserves 10's alert
+                    dock._on_agent_clicked(agent)
+                    self.assertEqual(focused_calls[-1], 30)
+                    self.assertEqual(tracker.get_alert_hwnds(), [10])
+
+                    # Second click jumps to remaining alerting window (10) and clears all alerts
+                    dock._on_agent_clicked(agent)
+                    self.assertEqual(focused_calls[-1], 10)
+                    self.assertEqual(tracker.get_alert_hwnds(), [])
+
+                    # Third click (no alerts left) resumes normal multi-window cycling: 10 -> 20
+                    dock._on_agent_clicked(agent)
+                    self.assertEqual(focused_calls[-1], 20)
+                finally:
+                    launcher._last_focused_by_agent.pop("ide-multi", None)
+                    dock.close()
+                    QThreadPool.globalInstance().waitForDone(3000)
+
+    def test_vertical_layout_aligns_window_strips_and_mirrors_on_right_edge(self):
+        from PySide6.QtCore import QThreadPool
+        from PySide6.QtWidgets import QApplication, QBoxLayout
+
+        from ai_docker import dock_window
+        from ai_docker.config import DEFAULT_UI
+
+        app = QApplication.instance() or QApplication(["regressions", "-platform", "offscreen"])
+        screen = app.primaryScreen()
+        geo = screen.availableGeometry()
+        agents = [
+            {"id": "a1", "name": "Agent 1", "type": "exe", "path": "", "match_process": "a1.exe"},
+            {"id": "a2", "name": "Agent 2", "type": "exe", "path": "", "match_process": "a2.exe"},
+            {"id": "a3", "name": "Agent 3", "type": "exe", "path": "", "match_process": "a3.exe"},
+        ]
+        win_map = {
+            "a1": [
+                {"hwnd": 101, "project": "Alpha", "title": "Alpha"},
+                {"hwnd": 102, "project": "Beta", "title": "Beta"},
+            ],
+            "a3": [
+                {"hwnd": 301 + idx, "project": f"Proj{idx}", "title": f"Proj{idx}"}
+                for idx in range(7)
+            ],
+        }
+        left_pos = [geo.left() + 24, geo.top() + 60]
+        config = {
+            "ui": {
+                **DEFAULT_UI,
+                "orientation": "vertical",
+                "hide_from_taskbar": False,
+                "auto_collapse": False,
+                "window_chip_width": 106,
+                "pos": left_pos,
+            },
+            "agents": agents,
+        }
+
+        with (
+            patch.object(dock_window, "load_config", return_value=config),
+            patch.object(dock_window, "save_config"),
+            patch.object(dock_window, "TaskbarHider"),
+            patch.object(dock_window, "NotificationTracker"),
+            patch.object(dock_window, "get_agent_window_map", return_value=win_map),
+        ):
+            dock = dock_window.AgentDockWindow()
+            dock._taskbar_hider.hidden_count = 0
+            dock._notif_tracker.poll.return_value = {}
+            dock._status_timer.stop()
+            dock._startup_update_timer.stop()
+            try:
+                dock.show()
+                dock._refresh_state()
+                app.processEvents()
+
+                self.assertTrue(dock._is_vertical())
+                self.assertFalse(dock._vertical_mirrored)
+                self.assertEqual(dock._top_bar.row_layout.direction(), QBoxLayout.TopToBottom)
+                self.assertTrue(dock._shelf.isVisible())
+
+                strips = dock._shelf.findChildren(dock_window.AgentHorizontalStrip)
+                self.assertEqual(len(strips), 2)
+                btn_a1 = dock._buttons["a1"]
+                btn_a3 = dock._buttons["a3"]
+
+                y_btn_a1 = btn_a1.mapTo(dock, btn_a1.rect().center()).y()
+                y_strip_a1 = strips[0].mapTo(dock, strips[0].rect().center()).y()
+                self.assertLessEqual(abs(y_btn_a1 - y_strip_a1), 1)
+
+                y_btn_a3 = btn_a3.mapTo(dock, btn_a3.rect().center()).y()
+                y_strip_a3 = strips[1].mapTo(dock, strips[1].rect().center()).y()
+                self.assertLessEqual(abs(y_btn_a3 - y_strip_a3), 1)
+                self.assertGreater(dock._top_bar._slot_widgets["a3"].height(), 46)
+
+                amenu = dock._build_agent_menu(agents[0])
+                move_act = next(a for a in amenu.actions() if a.menu() is not None and a.text() == "调整位置")
+                move_texts = [a.text() for a in move_act.menu().actions() if not a.isSeparator()]
+                self.assertIn("向上移一位", move_texts)
+                self.assertIn("移到最顶", move_texts)
+                amenu.deleteLater()
+
+                gmenu = dock._build_global_menu()
+                beh_act = next(a for a in gmenu.actions() if a.menu() is not None and a.text() == "显示与行为")
+                beh_texts = [a.text() for a in beh_act.menu().actions() if not a.isSeparator()]
+                self.assertIn("布局方向", beh_texts)
+                gmenu.deleteLater()
+
+                # Switching back to horizontal restores top bar + bottom cards
+                dock._set_orientation("horizontal")
+                app.processEvents()
+                self.assertFalse(dock._is_vertical())
+                self.assertEqual(dock._top_bar.row_layout.direction(), QBoxLayout.LeftToRight)
+            finally:
+                dock.close()
+                QThreadPool.globalInstance().waitForDone(3000)
+
+        # Right-edge vertical mirror keeps icon bar anchored on the right and expands strips leftward
+        right_anchor = [geo.right() - 80, geo.top() + 80]
+        mirrored_cfg = {
+            "ui": {
+                **DEFAULT_UI,
+                "orientation": "vertical",
+                "hide_from_taskbar": False,
+                "auto_collapse": True,
+                "window_chip_width": 106,
+                "pos": right_anchor,
+            },
+            "agents": agents,
+        }
+        with (
+            patch.object(dock_window, "load_config", return_value=mirrored_cfg),
+            patch.object(dock_window, "TaskbarHider"),
+            patch.object(dock_window, "NotificationTracker"),
+            patch.object(dock_window, "get_agent_window_map", return_value=win_map),
+        ):
+            dock = dock_window.AgentDockWindow()
+            dock._taskbar_hider.hidden_count = 0
+            dock._notif_tracker.poll.return_value = {}
+            dock._status_timer.stop()
+            dock._collapse_timer.stop()
+            dock._startup_update_timer.stop()
+            try:
+                dock.show()
+                dock._refresh_state()
+                app.processEvents()
+
+                self.assertTrue(dock._vertical_mirrored)
+                order = [dock._root_layout.itemAt(i).widget() for i in range(dock._root_layout.count())]
+                self.assertLess(order.index(dock._shelf), order.index(dock._top_bar))
+                self.assertEqual(dock.x() + dock.width(), right_anchor[0] + dock._orb.width())
+
+                dock._collapse_dock(force=True)
+                self.assertTrue(dock._collapsed)
+                self.assertEqual(dock.x(), right_anchor[0])
+            finally:
+                dock.close()
+                QThreadPool.globalInstance().waitForDone(3000)
+
+    def test_window_context_menu_closes_window_and_preserves_other_alerts(self):
+        import win32con
+        import win32gui
+        from PySide6.QtCore import QThreadPool
+        from PySide6.QtWidgets import QApplication
+
+        from ai_docker import dock_window, launcher
+        from ai_docker.config import DEFAULT_UI
+
+        hwnd = win32gui.CreateWindowEx(
+            0, "Static", "Close test", win32con.WS_POPUP, 0, 0, 20, 20, 0, 0, 0, None
+        )
+        self.addCleanup(lambda: win32gui.IsWindow(hwnd) and win32gui.DestroyWindow(hwnd))
+        self.assertFalse(launcher.close_hwnd(0))
+        self.assertTrue(launcher.close_hwnd(hwnd))
+        win32gui.PumpWaitingMessages()
+        self.assertFalse(win32gui.IsWindow(hwnd))
+
+        app = QApplication.instance() or QApplication(["regressions", "-platform", "offscreen"])
+        agent = {"id": "ide-close", "name": "IDE Close", "type": "exe", "path": "", "match_process": "ide.exe"}
+        config = {
+            "ui": {**DEFAULT_UI, "hide_from_taskbar": False, "auto_collapse": False},
+            "agents": [agent],
+        }
+        win_list = [
+            {"hwnd": 10, "project": "P1", "title": "P1 - IDE"},
+            {"hwnd": 20, "project": "P2", "title": "P2 - IDE"},
+        ]
+        with TemporaryDirectory() as directory:
+            tracker = NotificationTracker(Path(directory) / "absent.sqlite")
+            with (
+                patch.object(dock_window, "load_config", return_value=config),
+                patch.object(dock_window, "TaskbarHider"),
+                patch.object(dock_window, "NotificationTracker", return_value=tracker),
+                patch.object(dock_window, "get_agent_window_map", return_value={"ide-close": win_list}),
+            ):
+                dock = dock_window.AgentDockWindow()
+                dock._taskbar_hider.hidden_count = 0
+                dock._status_timer.stop()
+                dock._startup_update_timer.stop()
+                try:
+                    tracker.on_shell_flash(10, foreground_hwnd=0)
+                    tracker.on_shell_flash(20, foreground_hwnd=0)
+                    dock._refresh_state()
+
+                    menu = dock._build_agent_menu(agent, target_hwnd=10)
+                    close_act = next((a for a in menu.actions() if a.text() == "关闭该窗口"), None)
+                    self.assertIsNotNone(close_act)
+                    self.assertTrue(close_act.property("destructive"))
+
+                    with patch.object(dock_window, "close_hwnd", return_value=True) as mock_close:
+                        close_act.trigger()
+                    mock_close.assert_called_once_with(10)
+                    self.assertEqual(tracker.get_alert_hwnds(), [20])
+
+                    with (
+                        patch.object(dock_window, "close_hwnd", return_value=False),
+                        patch.object(dock_window.QMessageBox, "warning") as mock_warn,
+                    ):
+                        close_act.trigger()
+                    mock_warn.assert_called_once()
+                    self.assertEqual(tracker.get_alert_hwnds(), [20])
+                    menu.deleteLater()
+                finally:
+                    dock.close()
+                    QThreadPool.globalInstance().waitForDone(3000)
+
+    def test_vertical_reload_anchor_cross_screen_rollback_and_max_cols(self):
+        from PySide6.QtCore import QEvent, QPoint, QPointF, QThreadPool, Qt
+        from PySide6.QtGui import QMouseEvent
+        from PySide6.QtWidgets import QApplication
+
+        from ai_docker import dock_window
+        from ai_docker.config import DEFAULT_UI
+
+        app = QApplication.instance() or QApplication(["regressions", "-platform", "offscreen"])
+        screen = app.primaryScreen()
+        geo = screen.availableGeometry()
+        right_anchor = [geo.right() - 80, geo.top() + 80]
+        agents = [
+            {"id": "a1", "name": "Agent 1", "type": "exe", "path": "", "match_process": "a1.exe"},
+            {"id": "a2", "name": "Agent 2", "type": "exe", "path": "", "match_process": "a2.exe"},
+        ]
+        win_map = {
+            "a1": [
+                {"hwnd": 101, "project": "Alpha", "title": "Alpha"},
+                {"hwnd": 102, "project": "Beta", "title": "Beta"},
+            ]
+        }
+        vert_cfg = {
+            "ui": {
+                **DEFAULT_UI,
+                "orientation": "vertical",
+                "hide_from_taskbar": False,
+                "auto_collapse": False,
+                "window_chip_width": 106,
+                "pos": right_anchor,
+            },
+            "agents": agents,
+        }
+        horiz_cfg = {
+            "ui": {**vert_cfg["ui"], "orientation": "horizontal"},
+            "agents": agents,
+        }
+
+        with (
+            patch.object(dock_window, "load_config", side_effect=[vert_cfg, horiz_cfg]),
+            patch.object(dock_window, "save_config", side_effect=OSError("locked")),
+            patch.object(dock_window.QMessageBox, "warning"),
+            patch.object(dock_window, "TaskbarHider"),
+            patch.object(dock_window, "NotificationTracker"),
+            patch.object(dock_window, "get_agent_window_map", return_value=win_map),
+        ):
+            dock = dock_window.AgentDockWindow()
+            dock._taskbar_hider.hidden_count = 0
+            dock._notif_tracker.poll.return_value = {}
+            dock._status_timer.stop()
+            dock._startup_update_timer.stop()
+            try:
+                dock.show()
+                dock._refresh_state()
+                app.processEvents()
+
+                # Narrow-screen / wide-chip guard allows shrinking below 4 columns
+                self.assertEqual(dock._vertical_max_cols(geo.width()), 1)
+                self.assertTrue(dock._vertical_mirrored)
+
+                # Cross-screen drag rollback restores original position and mirrored layout if save fails
+                origin = dock.pos()
+                prev_anchor = dock._collapsed_anchor
+                dock._drag_origin = origin
+                dock._drag_offset = QPoint(0, 0)
+                dock.move(geo.left() + 10, origin.y())
+                release_evt = QMouseEvent(
+                    QEvent.Type.MouseButtonRelease,
+                    QPointF(5, 5),
+                    QPointF(5, 5),
+                    Qt.LeftButton,
+                    Qt.NoButton,
+                    Qt.NoModifier,
+                )
+                dock.mouseReleaseEvent(release_evt)
+                self.assertTrue(dock._vertical_mirrored)
+                self.assertEqual(dock._collapsed_anchor, prev_anchor)
+                self.assertEqual(dock.pos(), origin)
+
+                # Reloading from right-mirrored vertical to horizontal preserves right-edge anchor
+                dock._reload_all(force_refresh_icons=False, silent=True)
+                app.processEvents()
+                self.assertFalse(dock._is_vertical())
+                self.assertEqual(dock._collapsed_anchor, QPoint(right_anchor[0], right_anchor[1]))
+            finally:
+                dock.close()
+                QThreadPool.globalInstance().waitForDone(3000)
+
+    def test_drag_grip_double_click_collapses_to_orb_without_saving_config(self):
+        from PySide6.QtCore import QEvent, QPoint, QPointF, QThreadPool, Qt
+        from PySide6.QtGui import QMouseEvent
+        from PySide6.QtWidgets import QApplication
+
+        from ai_docker import dock_window
+        from ai_docker.config import DEFAULT_UI
+
+        app = QApplication.instance() or QApplication(["regressions", "-platform", "offscreen"])
+        screen = app.primaryScreen()
+        geo = screen.availableGeometry()
+        agents = [{"id": "a1", "name": "Agent 1", "type": "exe", "path": "", "match_process": "a1.exe"}]
+        win_map = {"a1": [{"hwnd": 101, "project": "Alpha", "title": "Alpha"}]}
+
+        def send_grip_dblclick(dock_obj: dock_window.AgentDockWindow) -> None:
+            grip = dock_obj._grip
+            local_pt = QPointF(grip.rect().center())
+            global_pt = QPointF(grip.mapToGlobal(grip.rect().center()))
+            for evt_type, btn, btns in (
+                (QEvent.Type.MouseButtonPress, Qt.LeftButton, Qt.LeftButton),
+                (QEvent.Type.MouseButtonRelease, Qt.LeftButton, Qt.NoButton),
+                (QEvent.Type.MouseButtonDblClick, Qt.LeftButton, Qt.LeftButton),
+                (QEvent.Type.MouseButtonRelease, Qt.LeftButton, Qt.NoButton),
+            ):
+                evt = QMouseEvent(evt_type, local_pt, global_pt, btn, btns, Qt.NoModifier)
+                app.sendEvent(grip, evt)
+
+        # 1. Horizontal mode: double-clicking DragGrip collapses immediately without writing config or bouncing open
+        horiz_cfg = {
+            "ui": {**DEFAULT_UI, "hide_from_taskbar": False, "auto_collapse": True, "pos": [geo.left() + 30, geo.top() + 40]},
+            "agents": agents,
+        }
+        with (
+            patch.object(dock_window, "load_config", return_value=horiz_cfg),
+            patch.object(dock_window, "save_config") as save_mock,
+            patch.object(dock_window, "TaskbarHider"),
+            patch.object(dock_window, "NotificationTracker"),
+            patch.object(dock_window, "get_agent_window_map", return_value=win_map),
+        ):
+            dock = dock_window.AgentDockWindow()
+            dock._taskbar_hider.hidden_count = 0
+            dock._notif_tracker.poll.return_value = {}
+            dock._status_timer.stop()
+            dock._collapse_timer.stop()
+            dock._startup_update_timer.stop()
+            try:
+                dock.show()
+                dock._refresh_state()
+                app.processEvents()
+                self.assertFalse(dock._collapsed)
+
+                send_grip_dblclick(dock)
+                self.assertTrue(dock._collapsed)
+                self.assertTrue(dock._orb.isVisible())
+                save_mock.assert_not_called()
+
+                # Cooldown prevents immediate hover bounce
+                dock._orb.hovered.emit()
+                self.assertTrue(dock._collapsed)
+            finally:
+                dock.close()
+                QThreadPool.globalInstance().waitForDone(3000)
+
+        # 2. Right-mirrored vertical mode: double-clicking DragGrip collapses to the right-edge anchor
+        right_anchor = [geo.right() - 80, geo.top() + 80]
+        vert_cfg = {
+            "ui": {
+                **DEFAULT_UI,
+                "orientation": "vertical",
+                "hide_from_taskbar": False,
+                "auto_collapse": True,
+                "window_chip_width": 106,
+                "pos": right_anchor,
+            },
+            "agents": agents,
+        }
+        with (
+            patch.object(dock_window, "load_config", return_value=vert_cfg),
+            patch.object(dock_window, "save_config") as save_mock,
+            patch.object(dock_window, "TaskbarHider"),
+            patch.object(dock_window, "NotificationTracker"),
+            patch.object(dock_window, "get_agent_window_map", return_value=win_map),
+        ):
+            dock = dock_window.AgentDockWindow()
+            dock._taskbar_hider.hidden_count = 0
+            dock._notif_tracker.poll.return_value = {}
+            dock._status_timer.stop()
+            dock._collapse_timer.stop()
+            dock._startup_update_timer.stop()
+            try:
+                dock.show()
+                dock._refresh_state()
+                app.processEvents()
+                self.assertTrue(dock._vertical_mirrored)
+
+                send_grip_dblclick(dock)
+                self.assertTrue(dock._collapsed)
+                self.assertEqual(dock.pos(), QPoint(right_anchor[0], right_anchor[1]))
+                save_mock.assert_not_called()
+            finally:
+                dock.close()
+                QThreadPool.globalInstance().waitForDone(3000)
+
+
+class CliTests(unittest.TestCase):
+    def test_cli_crud_visibility_order_config_and_json(self):
+        import io
+        import json
+        from contextlib import redirect_stderr, redirect_stdout
+
+        from ai_docker import cli
+
+        def run_cli(*argv: str) -> tuple[int, str, str]:
+            out, err = io.StringIO(), io.StringIO()
+            with (
+                patch.object(cli, "get_agent_window_map", return_value={}),
+                redirect_stdout(out),
+                redirect_stderr(err),
+            ):
+                code = cli.main(list(argv))
+            return code, out.getvalue(), err.getvalue()
+
+        with TemporaryDirectory() as directory:
+            cfg_path = Path(directory) / "agents.json"
+            cfg_path.write_text(
+                json.dumps(
+                    {
+                        "ui": {"theme": "dark", "auto_collapse": True, "auto_collapse_seconds": 8},
+                        "agents": [
+                            {"id": "cursor", "name": "Cursor", "type": "exe", "path": r"C:\Apps\Cursor.exe", "match_process": "Cursor.exe", "enabled": True}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            # schema --json
+            rc, out, _ = run_cli("schema", "--json")
+            self.assertEqual(rc, 0)
+            schema_resp = json.loads(out)
+            self.assertTrue(schema_resp["ok"])
+            self.assertIn("theme", schema_resp["data"]["ui_keys"])
+
+            # add web (flag before subcommand also works)
+            url = "https://quick.example.com/sn/account/000/start/chat?conversationId=test-1"
+            rc, out, _ = run_cli("--json", "--config", str(cfg_path), "add", "web", url, "--name", "Quick", "--match-title", "Quick Chat")
+            self.assertEqual(rc, 0)
+            added = json.loads(out)
+            self.assertTrue(added["ok"])
+            self.assertEqual(added["data"]["agent"]["id"], "quick")
+            self.assertEqual(added["data"]["agent"]["url"], url)
+            self.assertEqual(added["data"]["agent"]["match_title"], "Quick Chat")
+
+            # add cli
+            rc, out, _ = run_cli("add", "cli", "codex", "--name", "Codex CLI", "--config", str(cfg_path), "--json")
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out)["data"]["agent"]["type"], "cli")
+
+            # move quick to first
+            rc, out, _ = run_cli("move", "quick", "first", "--config", str(cfg_path), "--json")
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out)["data"]["visible_order"][0], "quick")
+
+            # hide & last-visible guard
+            rc, out, _ = run_cli("hide", "quick", "--config", str(cfg_path), "--json")
+            self.assertEqual(rc, 0)
+            rc, out, _ = run_cli("list", "--config", str(cfg_path), "--json")
+            self.assertEqual([a["id"] for a in json.loads(out)["data"]["agents"]], ["cursor", "codex-cli-cli"])
+            rc, out, _ = run_cli("show", "quick", "--config", str(cfg_path), "--json")
+            self.assertEqual(rc, 0)
+
+            # release & reclaim --all
+            rc, out, _ = run_cli("release", "cursor", "--config", str(cfg_path), "--json")
+            self.assertEqual(rc, 0)
+            self.assertFalse(json.loads(out)["data"]["agent"]["hide_from_taskbar"])
+            rc, out, _ = run_cli("reclaim", "--all", "--config", str(cfg_path), "--json")
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out)["data"]["reclaimed_ids"], ["cursor"])
+
+            # config set valid & invalid
+            rc, out, _ = run_cli("config", "set", "theme", "light", "--config", str(cfg_path), "--json")
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out)["data"]["value"], "light")
+            rc, out, _ = run_cli("config", "set", "orientation", "vertical", "--config", str(cfg_path), "--json")
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out)["data"]["value"], "vertical")
+            rc, out, _ = run_cli("config", "set", "orientation", "diagonal", "--config", str(cfg_path), "--json")
+            self.assertEqual(rc, 2)
+            self.assertFalse(json.loads(out)["ok"])
+            rc, out, _ = run_cli("config", "set", "icon_size", "99999", "--config", str(cfg_path), "--json")
+            self.assertEqual(rc, 2)
+            self.assertFalse(json.loads(out)["ok"])
+
+            # remove
+            rc, out, _ = run_cli("remove", "quick", "--config", str(cfg_path), "--json")
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out)["data"]["removed"]["id"], "quick")
