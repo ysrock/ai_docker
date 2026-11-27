@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import __version__
 from .config import (
@@ -14,8 +14,10 @@ from .config import (
     DEFAULT_UI,
     PROJECT_ROOT,
     ConfigLoadError,
+    is_taskbar_hide_excluded_agent,
     load_config,
     save_config,
+    update_config,
     validate_config,
 )
 from .discovery import build_agent_from_file, discover_new_agents, slugify_id
@@ -27,6 +29,7 @@ from .ipc import (
     close_dock_window,
     find_dock_window,
     send_dock_command,
+    send_dock_command_status,
 )
 from .launcher import get_agent_window_map, launch_agent
 from .web_utils import (
@@ -108,19 +111,20 @@ def _is_default_config(cfg_path: Path) -> bool:
         return cfg_path == CONFIG_PATH
 
 
-def _save_and_notify(cfg: dict[str, Any], cfg_path: Path, notify: bool) -> bool:
-    """Validate config in-memory, write atomically, and hot-reload running dock if applicable."""
+def _mutate_and_notify(
+    cfg_path: Path,
+    mutator: Callable[[dict[str, Any]], dict[str, Any]],
+    notify: bool,
+) -> tuple[dict[str, Any], bool]:
+    """Read-modify-write config atomically under inter-process lock and hot-reload dock."""
     try:
-        validated = validate_config(cfg)
+        updated = update_config(mutator, cfg_path)
     except ConfigLoadError as exc:
         raise CliError(f"配置值非法：{exc}", code="invalid_value", exit_code=2) from exc
-    try:
-        save_config(validated, cfg_path)
-    except OSError as exc:
+    except (OSError, TimeoutError) as exc:
         raise CliError(f"保存配置失败：{exc}", code="io_error") from exc
-    if notify and _is_default_config(cfg_path):
-        return send_dock_command(IPC_CMD_RELOAD)
-    return False
+    notified = send_dock_command(IPC_CMD_RELOAD) if (notify and _is_default_config(cfg_path)) else False
+    return updated, notified
 
 
 def _find_agent(cfg: dict[str, Any], agent_id: str) -> tuple[int, dict[str, Any]]:
@@ -146,7 +150,7 @@ def _agent_summary(agent: dict[str, Any], windows: list[dict[str, Any]]) -> dict
         "name": agent.get("name", ""),
         "type": agent.get("type", "exe"),
         "enabled": agent.get("enabled", True) is not False,
-        "released_to_taskbar": agent.get("hide_from_taskbar", True) is False,
+        "released_to_taskbar": (agent.get("hide_from_taskbar", True) is False) or is_taskbar_hide_excluded_agent(agent),
         "running": len(windows) > 0,
         "window_count": len(windows),
         "projects": [w.get("project", "") for w in windows],
@@ -212,189 +216,223 @@ def _cmd_status(_args: argparse.Namespace, cfg_path: Path, _notify: bool) -> tup
 
 
 def _cmd_add(args: argparse.Namespace, cfg_path: Path, notify: bool) -> tuple[dict[str, Any], str]:
-    cfg = load_config(cfg_path)
-    agents = list(cfg.get("agents", []))
-    existing_ids = {a.get("id", "") for a in agents}
     kind = args.add_type
+    created_holder: dict[str, Any] = {}
 
-    if kind == "web":
-        url = normalize_web_url(args.url)
-        if not url:
-            raise CliError(f"无效的网页地址：{args.url!r}", code="invalid_url", exit_code=2)
-        name = (args.name or "").strip() or suggest_web_agent_name(url)
-        aid = slugify_id(args.id or name, existing_ids)
-        match_title = (args.match_title or "").strip() or name
-        match_process, notif_handlers = detect_web_browser_matching(args.browser)
-        entry: dict[str, Any] = {
-            "id": aid,
-            "name": name,
-            "type": "web",
-            "url": url,
-            "app_mode": not args.no_app_mode,
-            "match_process": match_process,
-            "match_title": match_title,
-            "notification_handlers": notif_handlers,
-            "notification_keywords": [match_title.lower()],
-            "enabled": True,
-        }
-        if args.browser:
-            entry["browser"] = args.browser
-        if args.icon:
-            entry["icon_source"] = args.icon
-    elif kind == "exe":
-        entry = build_agent_from_file(args.path, agents)
-        if not entry:
-            raise CliError(f"找不到有效的 .exe 或 .lnk 文件：{args.path}", code="invalid_path", exit_code=2)
-        if args.name:
-            entry["name"] = args.name.strip()
-        if args.id or args.name:
-            entry["id"] = slugify_id(args.id or entry["name"], existing_ids)
-        if args.match_process:
-            entry["match_process"] = args.match_process.strip()
-        if args.no_match_path:
-            entry["match_path"] = False
-        if args.args:
-            entry["args"] = list(args.args)
-    elif kind == "cli":
-        cmd = args.command.strip()
-        if not cmd:
-            raise CliError("CLI 命令不能为空", code="invalid_command", exit_code=2)
-        name = (args.name or "").strip() or cmd.split()[0]
-        aid = slugify_id(args.id or f"{name}-cli", existing_ids)
-        title = (args.title or "").strip() or name
-        entry = {
-            "id": aid,
-            "name": name,
-            "type": "cli",
-            "command": cmd,
-            "terminal_title": title,
-            "cwd": args.cwd or str(Path.home()),
-            "cli_badge": True,
-            "match_process": "WindowsTerminal.exe",
-            "match_title": title,
-            "notification_handlers": ["Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"],
-            "notification_keywords": [name.lower()],
-            "enabled": True,
-        }
-        if args.icon:
-            entry["icon_source"] = args.icon
-    elif kind == "msix":
-        aumid = args.aumid.strip()
-        if "!" not in aumid:
-            raise CliError("MSIX AUMID 格式应为 PackageFamilyName!AppId", code="invalid_aumid", exit_code=2)
-        name = (args.name or "").strip() or aumid.split("!", 1)[1]
-        aid = slugify_id(args.id or name, existing_ids)
-        entry = {
-            "id": aid,
-            "name": name,
-            "type": "msix",
-            "aumid": aumid,
-            "match_process": (args.match_process or "").strip() or f"{name}.exe",
-            "notification_handlers": [aumid],
-            "enabled": True,
-        }
-    else:
-        raise CliError(f"不支持的 Agent 类型：{kind}", code="invalid_type", exit_code=2)
+    def _build_and_append(cfg: dict[str, Any]) -> dict[str, Any]:
+        agents = list(cfg.get("agents", []))
+        existing_ids = {a.get("id", "") for a in agents}
+        if kind == "web":
+            url = normalize_web_url(args.url)
+            if not url:
+                raise CliError(f"无效的网页地址：{args.url!r}", code="invalid_url", exit_code=2)
+            name = (args.name or "").strip() or suggest_web_agent_name(url)
+            aid = slugify_id(args.id or name, existing_ids)
+            match_title = (args.match_title or "").strip() or name
+            match_process, notif_handlers = detect_web_browser_matching(args.browser)
+            entry: dict[str, Any] = {
+                "id": aid,
+                "name": name,
+                "type": "web",
+                "url": url,
+                "app_mode": not args.no_app_mode,
+                "match_process": match_process,
+                "match_title": match_title,
+                "notification_handlers": notif_handlers,
+                "notification_keywords": [match_title.lower()],
+                "enabled": True,
+            }
+            if args.browser:
+                entry["browser"] = args.browser
+            if args.icon:
+                entry["icon_source"] = args.icon
+        elif kind == "exe":
+            entry = build_agent_from_file(args.path, agents)
+            if not entry:
+                raise CliError(f"找不到有效的 .exe 或 .lnk 文件：{args.path}", code="invalid_path", exit_code=2)
+            if args.name:
+                entry["name"] = args.name.strip()
+            if args.id or args.name:
+                entry["id"] = slugify_id(args.id or entry["name"], existing_ids)
+            if args.match_process:
+                entry["match_process"] = args.match_process.strip()
+            if args.no_match_path:
+                entry["match_path"] = False
+            if args.args:
+                entry["args"] = list(args.args)
+        elif kind == "cli":
+            cmd = args.cli_command.strip()
+            if not cmd:
+                raise CliError("CLI 命令不能为空", code="invalid_command", exit_code=2)
+            name = (args.name or "").strip() or cmd.split()[0]
+            aid = slugify_id(args.id or f"{name}-cli", existing_ids)
+            title = (args.title or "").strip() or name
+            entry = {
+                "id": aid,
+                "name": name,
+                "type": "cli",
+                "command": cmd,
+                "terminal_title": title,
+                "cwd": args.cwd or str(Path.home()),
+                "cli_badge": True,
+                "match_process": "WindowsTerminal.exe",
+                "match_title": title,
+                "notification_handlers": ["Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"],
+                "notification_keywords": [name.lower()],
+                "enabled": True,
+            }
+            if args.icon:
+                entry["icon_source"] = args.icon
+        elif kind == "msix":
+            aumid = args.aumid.strip()
+            if "!" not in aumid:
+                raise CliError("MSIX AUMID 格式应为 PackageFamilyName!AppId", code="invalid_aumid", exit_code=2)
+            name = (args.name or "").strip() or aumid.split("!", 1)[1]
+            aid = slugify_id(args.id or name, existing_ids)
+            entry = {
+                "id": aid,
+                "name": name,
+                "type": "msix",
+                "aumid": aumid,
+                "match_process": (args.match_process or "").strip() or f"{name}.exe",
+                "notification_handlers": [aumid],
+                "enabled": True,
+            }
+        else:
+            raise CliError(f"不支持的 Agent 类型：{kind}", code="invalid_type", exit_code=2)
 
-    agents.append(entry)
-    new_cfg = {**cfg, "agents": agents}
-    notified = _save_and_notify(new_cfg, cfg_path, notify)
+        created_holder["entry"] = entry
+        agents.append(entry)
+        return {**cfg, "agents": agents}
+
+    _, notified = _mutate_and_notify(cfg_path, _build_and_append, notify)
+    entry = created_holder["entry"]
     return {"agent": entry, "dock_notified": notified}, f"已添加 {entry['type']} Agent: {entry['name']} ({entry['id']})"
 
 
 def _cmd_remove(args: argparse.Namespace, cfg_path: Path, notify: bool) -> tuple[dict[str, Any], str]:
-    cfg = load_config(cfg_path)
-    agents = list(cfg.get("agents", []))
-    idx, target = _find_agent(cfg, args.agent_id)
-    if target.get("enabled", True) is not False:
-        remaining_visible = sum(
-            1 for i, a in enumerate(agents) if i != idx and a.get("enabled", True) is not False
-        )
-        if remaining_visible == 0 and not args.force:
-            raise CliError(
-                "至少需要保留 1 个可见 Agent（如确需删除请加 --force）",
-                code="last_visible_agent",
+    removed_holder: dict[str, Any] = {}
+
+    def _remove(cfg: dict[str, Any]) -> dict[str, Any]:
+        agents = list(cfg.get("agents", []))
+        idx, target = _find_agent(cfg, args.agent_id)
+        if target.get("enabled", True) is not False:
+            remaining_visible = sum(
+                1 for i, a in enumerate(agents) if i != idx and a.get("enabled", True) is not False
             )
-    removed = agents.pop(idx)
-    notified = _save_and_notify({**cfg, "agents": agents}, cfg_path, notify)
+            if remaining_visible == 0 and not args.force:
+                raise CliError(
+                    "至少需要保留 1 个可见 Agent（如确需删除请加 --force）",
+                    code="last_visible_agent",
+                )
+        removed_holder["removed"] = agents.pop(idx)
+        return {**cfg, "agents": agents}
+
+    _, notified = _mutate_and_notify(cfg_path, _remove, notify)
+    removed = removed_holder["removed"]
     return {"removed": removed, "dock_notified": notified}, f"已移除 Agent: {removed.get('name')} ({removed.get('id')})"
 
 
 def _cmd_visibility(args: argparse.Namespace, cfg_path: Path, notify: bool, visible: bool) -> tuple[dict[str, Any], str]:
-    cfg = load_config(cfg_path)
-    agents = list(cfg.get("agents", []))
-    idx, target = _find_agent(cfg, args.agent_id)
-    if not visible:
-        visible_count = sum(1 for a in agents if a.get("enabled", True) is not False)
-        if target.get("enabled", True) is not False and visible_count <= 1:
-            raise CliError("至少需要保留 1 个可见 Agent，无法隐藏最后一个图标", code="last_visible_agent")
-    agents[idx] = {**target, "enabled": visible}
-    notified = _save_and_notify({**cfg, "agents": agents}, cfg_path, notify)
+    updated_holder: dict[str, Any] = {}
+
+    def _set_vis(cfg: dict[str, Any]) -> dict[str, Any]:
+        agents = list(cfg.get("agents", []))
+        idx, target = _find_agent(cfg, args.agent_id)
+        if not visible:
+            visible_count = sum(1 for a in agents if a.get("enabled", True) is not False)
+            if target.get("enabled", True) is not False and visible_count <= 1:
+                raise CliError("至少需要保留 1 个可见 Agent，无法隐藏最后一个图标", code="last_visible_agent")
+        agents[idx] = {**target, "enabled": visible}
+        updated_holder["agent"] = agents[idx]
+        return {**cfg, "agents": agents}
+
+    _, notified = _mutate_and_notify(cfg_path, _set_vis, notify)
+    target = updated_holder["agent"]
     action = "显示" if visible else "隐藏"
-    return {"agent": agents[idx], "dock_notified": notified}, f"已{action} Agent: {target.get('name')} ({target.get('id')})"
+    return {"agent": target, "dock_notified": notified}, f"已{action} Agent: {target.get('name')} ({target.get('id')})"
 
 
 def _cmd_taskbar_release(
     args: argparse.Namespace, cfg_path: Path, notify: bool, released: bool
 ) -> tuple[dict[str, Any], str]:
-    cfg = load_config(cfg_path)
-    agents = list(cfg.get("agents", []))
-    if not released and getattr(args, "all", False):
-        changed_ids: list[str] = []
-        for i, ag in enumerate(agents):
-            if ag.get("hide_from_taskbar", True) is False:
-                agents[i] = {**ag, "hide_from_taskbar": True}
-                changed_ids.append(ag.get("id", ""))
-        notified = _save_and_notify({**cfg, "agents": agents}, cfg_path, notify)
-        return {"reclaimed_ids": changed_ids, "dock_notified": notified}, f"已重新收进 {len(changed_ids)} 个 Agent"
-
-    if not args.agent_id:
+    if not released and not getattr(args, "all", False) and not args.agent_id:
         raise CliError("请指定 agent_id（或使用 reclaim --all）", code="missing_argument", exit_code=2)
-    idx, target = _find_agent(cfg, args.agent_id)
-    agents[idx] = {**target, "hide_from_taskbar": (not released)}
-    notified = _save_and_notify({**cfg, "agents": agents}, cfg_path, notify)
+
+    state_holder: dict[str, Any] = {}
+
+    def _set_rel(cfg: dict[str, Any]) -> dict[str, Any]:
+        agents = list(cfg.get("agents", []))
+        if not released and getattr(args, "all", False):
+            changed_ids: list[str] = []
+            for i, ag in enumerate(agents):
+                if ag.get("hide_from_taskbar", True) is False:
+                    agents[i] = {**ag, "hide_from_taskbar": True}
+                    changed_ids.append(ag.get("id", ""))
+            state_holder["reclaimed_ids"] = changed_ids
+            return {**cfg, "agents": agents}
+
+        idx, target = _find_agent(cfg, args.agent_id)
+        agents[idx] = {**target, "hide_from_taskbar": (not released)}
+        state_holder["agent"] = agents[idx]
+        return {**cfg, "agents": agents}
+
+    _, notified = _mutate_and_notify(cfg_path, _set_rel, notify)
+    if "reclaimed_ids" in state_holder:
+        changed_ids = state_holder["reclaimed_ids"]
+        return {"reclaimed_ids": changed_ids, "dock_notified": notified}, f"已重新收进 {len(changed_ids)} 个 Agent"
+    target = state_holder["agent"]
     verb = "释放到任务栏" if released else "重新收进悬浮窗"
-    return {"agent": agents[idx], "dock_notified": notified}, f"已{verb}: {target.get('name')} ({target.get('id')})"
+    return {"agent": target, "dock_notified": notified}, f"已{verb}: {target.get('name')} ({target.get('id')})"
 
 
 def _cmd_move(args: argparse.Namespace, cfg_path: Path, notify: bool) -> tuple[dict[str, Any], str]:
-    cfg = load_config(cfg_path)
-    agents = list(cfg.get("agents", []))
-    visible_slots = [i for i, a in enumerate(agents) if a.get("enabled", True) is not False]
-    visible_items = [agents[i] for i in visible_slots]
-    cur_idx = next((i for i, a in enumerate(visible_items) if a.get("id") == args.agent_id), -1)
-    if cur_idx < 0:
-        raise CliError(f"找不到可见 Agent：{args.agent_id}", code="not_found")
+    move_holder: dict[str, Any] = {}
 
-    pos_raw = str(args.position).strip().lower()
-    if pos_raw == "first":
-        new_idx = 0
-    elif pos_raw == "last":
-        new_idx = len(visible_items) - 1
-    elif pos_raw == "left":
-        new_idx = max(0, cur_idx - 1)
-    elif pos_raw == "right":
-        new_idx = min(len(visible_items) - 1, cur_idx + 1)
-    else:
-        try:
-            new_idx = max(0, min(len(visible_items) - 1, int(pos_raw)))
-        except ValueError as exc:
-            raise CliError(
-                "位置参数需为整数索引，或 first / last / left / right",
-                code="invalid_position",
-                exit_code=2,
-            ) from exc
+    def _move(cfg: dict[str, Any]) -> dict[str, Any]:
+        agents = list(cfg.get("agents", []))
+        visible_slots = [i for i, a in enumerate(agents) if a.get("enabled", True) is not False]
+        visible_items = [agents[i] for i in visible_slots]
+        cur_idx = next((i for i, a in enumerate(visible_items) if a.get("id") == args.agent_id), -1)
+        if cur_idx < 0:
+            raise CliError(f"找不到可见 Agent：{args.agent_id}", code="not_found")
 
-    moved = visible_items.pop(cur_idx)
-    visible_items.insert(new_idx, moved)
-    for slot, item in zip(visible_slots, visible_items):
-        agents[slot] = item
+        pos_raw = str(args.position).strip().lower()
+        if pos_raw == "first":
+            new_idx = 0
+        elif pos_raw == "last":
+            new_idx = len(visible_items) - 1
+        elif pos_raw == "left":
+            new_idx = max(0, cur_idx - 1)
+        elif pos_raw == "right":
+            new_idx = min(len(visible_items) - 1, cur_idx + 1)
+        else:
+            try:
+                new_idx = max(0, min(len(visible_items) - 1, int(pos_raw)))
+            except ValueError as exc:
+                raise CliError(
+                    "位置参数需为整数索引，或 first / last / left / right",
+                    code="invalid_position",
+                    exit_code=2,
+                ) from exc
 
-    notified = _save_and_notify({**cfg, "agents": agents}, cfg_path, notify)
-    order = [a.get("id", "") for a in visible_items]
+        moved = visible_items.pop(cur_idx)
+        visible_items.insert(new_idx, moved)
+        for slot, item in zip(visible_slots, visible_items):
+            agents[slot] = item
+        move_holder["index"] = new_idx
+        move_holder["order"] = [a.get("id", "") for a in visible_items]
+        return {**cfg, "agents": agents}
+
+    _, notified = _mutate_and_notify(cfg_path, _move, notify)
     return (
-        {"agent_id": args.agent_id, "index": new_idx, "visible_order": order, "dock_notified": notified},
-        f"已将 {args.agent_id} 移动到可见位置 {new_idx}",
+        {
+            "agent_id": args.agent_id,
+            "index": move_holder["index"],
+            "visible_order": move_holder["order"],
+            "dock_notified": notified,
+        },
+        f"已将 {args.agent_id} 移动到可见位置 {move_holder['index']}",
     )
 
 
@@ -409,12 +447,24 @@ def _cmd_open(args: argparse.Namespace, cfg_path: Path, _notify: bool) -> tuple[
 
 
 def _cmd_discover(args: argparse.Namespace, cfg_path: Path, notify: bool) -> tuple[dict[str, Any], str]:
-    cfg = load_config(cfg_path)
-    existing = list(cfg.get("agents", []))
-    found = discover_new_agents(existing)
-    notified = False
-    if args.apply and found:
-        notified = _save_and_notify({**cfg, "agents": [*existing, *found]}, cfg_path, notify)
+    if not args.apply:
+        cfg = load_config(cfg_path)
+        found = discover_new_agents(list(cfg.get("agents", [])))
+        notified = False
+    else:
+        found_holder: dict[str, list[dict[str, Any]]] = {"found": []}
+
+        def _apply_discover(cfg: dict[str, Any]) -> dict[str, Any]:
+            existing = list(cfg.get("agents", []))
+            discovered = discover_new_agents(existing)
+            found_holder["found"] = discovered
+            if not discovered:
+                return cfg
+            return {**cfg, "agents": [*existing, *discovered]}
+
+        _, notified = _mutate_and_notify(cfg_path, _apply_discover, notify)
+        found = found_holder["found"]
+
     lines = [f"{a['id']:<20} {a['type']:<5} {a['name']} -> {_agent_target(a)}" for a in found]
     if args.apply:
         header = f"已扫描并导入 {len(found)} 个新 Agent" if found else "未发现新的本机 Agent"
@@ -425,8 +475,8 @@ def _cmd_discover(args: argparse.Namespace, cfg_path: Path, notify: bool) -> tup
 
 
 def _cmd_config(args: argparse.Namespace, cfg_path: Path, notify: bool) -> tuple[dict[str, Any], str]:
-    cfg = load_config(cfg_path)
     if args.config_action == "get":
+        cfg = load_config(cfg_path)
         ui = cfg.get("ui", {})
         if args.key:
             if args.key not in ui:
@@ -436,9 +486,11 @@ def _cmd_config(args: argparse.Namespace, cfg_path: Path, notify: bool) -> tuple
 
     if args.config_action == "set":
         parsed_val = _parse_ui_value(args.key, args.value)
-        new_ui = {**cfg.get("ui", {}), args.key: parsed_val}
-        candidate = {**cfg, "ui": new_ui}
-        notified = _save_and_notify(candidate, cfg_path, notify)
+
+        def _set_ui(cfg: dict[str, Any]) -> dict[str, Any]:
+            return {**cfg, "ui": {**cfg.get("ui", {}), args.key: parsed_val}}
+
+        _, notified = _mutate_and_notify(cfg_path, _set_ui, notify)
         return {"key": args.key, "value": parsed_val, "dock_notified": notified}, f"已更新 ui.{args.key} = {parsed_val!r}"
 
     raise CliError("未知 config 子命令", code="invalid_command", exit_code=2)
@@ -474,9 +526,9 @@ def _cmd_dock(args: argparse.Namespace, _cfg_path: Path, _notify: bool) -> tuple
         "clear-notifications": (IPC_CMD_CLEAR_NOTIFICATIONS, "已通知悬浮窗清除全部通知角标"),
     }
     ipc_code, ok_msg = cmd_map[action]
-    sent = send_dock_command(ipc_code)
+    sent, err_code, err_msg = send_dock_command_status(ipc_code)
     if not sent:
-        raise CliError("未检测到正在运行的 AI docker 实例", code="dock_not_running")
+        raise CliError(err_msg, code=err_code)
     return {"action": action, "dock_notified": True}, ok_msg
 
 
@@ -503,11 +555,7 @@ def _cmd_update(args: argparse.Namespace, _cfg_path: Path, _notify: bool) -> tup
         return data, "\n".join(lines)
 
     if args.update_action == "apply":
-        dock = find_dock_window()
-        wait_pid = dock[1] if dock else None
-        if dock:
-            close_dock_window()
-        ok, detail = launch_updater_script(wait_pid=wait_pid, gui_mode=False)
+        ok, detail = launch_updater_script(wait_pid=None, gui_mode=False)
         if not ok:
             raise CliError(detail, code="update_failed")
         return {"started": True, "script": detail}, f"已拉起更新脚本：{detail}"
@@ -547,8 +595,17 @@ def _cmd_schema(_args: argparse.Namespace, _cfg_path: Path, _notify: bool) -> tu
     return schema, json.dumps(schema, ensure_ascii=False, indent=2)
 
 
+class _ArgParseError(Exception):
+    """Raised on argparse validation error so --json mode can emit structured JSON."""
+
+
+class _JsonAwareArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise _ArgParseError(message)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    common = argparse.ArgumentParser(add_help=False)
+    common = _JsonAwareArgumentParser(add_help=False)
     common.add_argument(
         "--json",
         action="store_true",
@@ -567,7 +624,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="修改配置后不向运行中的悬浮窗发送热重载信号",
     )
 
-    parser = argparse.ArgumentParser(
+    parser = _JsonAwareArgumentParser(
         prog="ai-docker",
         description="AI docker CLI：面向自动化与 AI Agent 的悬浮窗控制接口",
         parents=[common],
@@ -607,7 +664,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_add_exe.set_defaults(handler=_cmd_add)
 
     p_add_cli = add_sub.add_parser("cli", parents=[common], help="添加终端 CLI Agent")
-    p_add_cli.add_argument("command", help="启动命令（如 claude / gemini / opencode）")
+    p_add_cli.add_argument("cli_command", metavar="command", help="启动命令（如 claude / gemini / opencode）")
     p_add_cli.add_argument("--id", help="自定义 Agent ID")
     p_add_cli.add_argument("--name", help="显示名称")
     p_add_cli.add_argument("--title", help="终端窗口标题")
@@ -686,18 +743,60 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _wants_json_before_double_dash(raw_argv: list[str]) -> bool:
+    for token in raw_argv:
+        if token == "--":
+            break
+        if token == "--json":
+            return True
+    return False
+
+
 def main(argv: list[str] | None = None) -> int:
     _configure_stdio()
     parser = build_parser()
-    raw_argv = list(sys.argv[1:] if argv is None else argv)
-    want_json_early = "--json" in raw_argv
+    if argv is None:
+        env_argv = os.environ.pop("AI_DOCKER_ARGV_JSON", None)
+        if env_argv is not None:
+            try:
+                decoded = json.loads(env_argv)
+            except ValueError:
+                decoded = None
+            if isinstance(decoded, list):
+                raw_argv = [str(item) for item in decoded]
+            elif isinstance(decoded, str):
+                raw_argv = [decoded]
+            else:
+                raw_argv = list(sys.argv[1:])
+        else:
+            raw_argv = list(sys.argv[1:])
+    else:
+        raw_argv = list(argv)
+    want_json_early = _wants_json_before_double_dash(raw_argv)
 
     try:
         args = parser.parse_args(raw_argv)
+    except _ArgParseError as exc:
+        if want_json_early:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "command": "",
+                        "code": "invalid_arguments",
+                        "error": str(exc),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        else:
+            parser.print_usage(sys.stderr)
+            print(f"{parser.prog}: error: {exc}", file=sys.stderr)
+        return 2
     except SystemExit as exc:
         return int(exc.code or 0)
 
-    as_json = bool(getattr(args, "json", False)) or want_json_early
+    as_json = bool(getattr(args, "json", False))
     cfg_path = Path(getattr(args, "config", CONFIG_PATH))
     notify = not bool(getattr(args, "no_notify", False))
     cmd_name = getattr(args, "command", "")

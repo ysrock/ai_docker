@@ -1,9 +1,8 @@
 @echo off
-setlocal
+setlocal DisableDelayedExpansion
 set "ROOT=%~dp0"
-if exist "%ROOT%.venv\Scripts\python.exe" (
-    "%ROOT%.venv\Scripts\python.exe" -m ai_docker %*
-) else (
-    python -m ai_docker %*
-)
+set "PYTHONPATH=%ROOT%;%PYTHONPATH%"
+set "PY_EXE=python"
+if exist "%ROOT%.venv\Scripts\python.exe" set "PY_EXE=%ROOT%.venv\Scripts\python.exe"
+"%PY_EXE%" -m ai_docker %*
 exit /b %ERRORLEVEL%

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
+import os
 import sys
 from ctypes import wintypes
 
@@ -11,11 +13,20 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from ai_docker.config import ConfigLoadError, PROJECT_ROOT
 from ai_docker.dock_window import AgentDockWindow
 
+SYNCHRONIZE = 0x00100000
+ERROR_ACCESS_DENIED = 5
 ERROR_ALREADY_EXISTS = 183
+_INSTALL_HASH = hashlib.sha256(
+    os.path.normcase(os.path.abspath(str(PROJECT_ROOT))).encode("utf-8")
+).hexdigest()
+INSTANCE_MUTEX_NAME = f"Local\\AI_docker_Instance_{_INSTALL_HASH}"
+UPDATE_MUTEX_NAME = f"Local\\AI_docker_Update_{_INSTALL_HASH}"
 
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
 _kernel32.CreateMutexW.restype = wintypes.HANDLE
+_kernel32.OpenMutexW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+_kernel32.OpenMutexW.restype = wintypes.HANDLE
 _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 _kernel32.CloseHandle.restype = wintypes.BOOL
 
@@ -33,12 +44,26 @@ def _acquire_single_instance_mutex(
     return int(handle)
 
 
-def main() -> int:
-    mutex = _acquire_single_instance_mutex()
-    if mutex is None:
-        return 0
+def _is_update_in_progress(name: str = UPDATE_MUTEX_NAME) -> bool:
+    handle = _kernel32.OpenMutexW(SYNCHRONIZE, False, name)
+    if handle:
+        _kernel32.CloseHandle(handle)
+        return True
+    return ctypes.get_last_error() == ERROR_ACCESS_DENIED
 
+
+def main() -> int:
+    install_mutex = _acquire_single_instance_mutex(INSTANCE_MUTEX_NAME)
+    if install_mutex is None:
+        return 0
+    mutex: int | None = None
     try:
+        if _is_update_in_progress():
+            return 0
+        mutex = _acquire_single_instance_mutex()
+        if mutex is None:
+            return 0
+
         QApplication.setHighDpiScaleFactorRoundingPolicy(
             Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
         )
@@ -60,7 +85,9 @@ def main() -> int:
         dock.show()
         return app.exec()
     finally:
-        _kernel32.CloseHandle(wintypes.HANDLE(mutex))
+        if mutex is not None:
+            _kernel32.CloseHandle(wintypes.HANDLE(mutex))
+        _kernel32.CloseHandle(wintypes.HANDLE(install_mutex))
 
 
 if __name__ == "__main__":

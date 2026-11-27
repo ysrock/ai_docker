@@ -119,15 +119,16 @@ uv sync
 .\ai-docker.cmd update check --json
 ```
 
-也可以通过 `.\.venv\Scripts\python.exe -m ai_docker ...` 直接调用。
+也可以通过 `.\ai-docker.ps1 ...`（PowerShell 原生直传，推荐包含 `&` / `;` 等特殊字符时使用）或 `.\.venv\Scripts\python.exe -m ai_docker ...` 直接调用。
 
 ## 项目目录结构
 
 ```text
 ai_docker/
-├── main.py                       # 程序入口（单实例互斥锁 + 高分屏配置）
+├── main.py                       # 程序入口（单实例互斥锁 + 更新锁互斥 + 高分屏配置）
 ├── start_dock.pyw                # 无控制台 Python 入口
-├── ai-docker.cmd                 # Windows 命令行快捷入口（转发至 python -m ai_docker）
+├── ai-docker.cmd                 # Windows 批处理快捷入口（支持仓外调用）
+├── ai-docker.ps1                 # Windows PowerShell 原生参数直传 CLI 入口
 ├── build_launcher.ps1            # 一键编译原生 AI docker.exe 并创建开始菜单快捷方式
 ├── update.ps1                    # 一键优雅退出、快进拉取、同步依赖并重启脚本
 ├── launcher_src/

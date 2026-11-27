@@ -19,8 +19,9 @@ IPC_CMD_COLLAPSE = 3
 IPC_CMD_CLEAR_NOTIFICATIONS = 4
 
 WM_CLOSE = 0x0010
+ERROR_ACCESS_DENIED = 5
 
-_user32 = ctypes.windll.user32
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
 _EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
 _user32.EnumWindows.argtypes = [_EnumWindowsProc, wintypes.LPARAM]
@@ -54,16 +55,34 @@ def find_dock_window(install_property: str = INSTALL_PROPERTY) -> tuple[int, int
     return found[0] if found else None
 
 
-def send_dock_command(cmd: int, install_property: str = INSTALL_PROPERTY) -> bool:
-    """Post a control command to the running AI docker window, if present."""
+def send_dock_command_status(
+    cmd: int, install_property: str = INSTALL_PROPERTY
+) -> tuple[bool, str, str]:
+    """Post a control command to the running AI docker window and return detailed status."""
     target = find_dock_window(install_property)
     if target is None:
-        return False
-    hwnd, _ = target
+        return False, "dock_not_running", "未检测到正在运行的 AI docker 实例"
+    hwnd, pid = target
     msg_id = int(_user32.RegisterWindowMessageW(IPC_CONTROL_MESSAGE_NAME))
     if not msg_id:
-        return False
-    return bool(_user32.PostMessageW(hwnd, msg_id, int(cmd), 0))
+        return False, "ipc_failed", "注册 Win32 控制消息失败"
+    ctypes.set_last_error(0)
+    if _user32.PostMessageW(hwnd, msg_id, int(cmd), 0):
+        return True, "ok", ""
+    err = ctypes.get_last_error()
+    if err == ERROR_ACCESS_DENIED:
+        return (
+            False,
+            "permission_denied",
+            f"无法向 AI docker (PID {pid}) 发送控制消息（可能因管理员权限/UIPI 隔离被系统拦截）",
+        )
+    return False, "ipc_failed", f"向 AI docker (PID {pid}) 发送控制消息失败（错误码 {err}）"
+
+
+def send_dock_command(cmd: int, install_property: str = INSTALL_PROPERTY) -> bool:
+    """Post a control command to the running AI docker window, if present."""
+    ok, _, _ = send_dock_command_status(cmd, install_property)
+    return ok
 
 
 def close_dock_window(
@@ -75,7 +94,11 @@ def close_dock_window(
     if target is None:
         return False, "AI docker 当前未运行"
     hwnd, pid = target
+    ctypes.set_last_error(0)
     if not _user32.PostMessageW(hwnd, WM_CLOSE, 0, 0):
+        err = ctypes.get_last_error()
+        if err == ERROR_ACCESS_DENIED:
+            return False, f"向 AI docker (PID {pid}) 发送关闭消息被权限/UIPI 拦截"
         return False, f"向 AI docker (PID {pid}) 发送关闭消息失败"
 
     deadline = time.monotonic() + timeout_sec

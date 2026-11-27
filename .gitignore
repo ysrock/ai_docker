@@ -4,4 +4,5 @@ __pycache__/
 *.pyc
 *.pyo
 agents.json
+.agents.json.lock
 AI docker.exe

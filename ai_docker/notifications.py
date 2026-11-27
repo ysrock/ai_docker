@@ -197,6 +197,62 @@ class NotificationTracker:
         for hwnd in hwnds or ():
             self.clear_window(hwnd)
 
+    def clear_all(
+        self,
+        agents: list[dict[str, Any]],
+        agent_windows: dict[str, list[dict[str, Any]]],
+    ) -> None:
+        """Advance DB watermark/badges and dismiss all current alerts atomically."""
+        conn = self._connect_ro()
+        if conn is not None:
+            try:
+                conn.execute("BEGIN")
+                max_row = conn.execute("SELECT COALESCE(MAX(Id), 0) FROM Notification").fetchone()
+                if max_row and max_row[0]:
+                    self._last_toast_id = max(self._last_toast_id, int(max_row[0]))
+                handler_to_agents: dict[str, list[dict[str, Any]]] = {}
+                for agent in agents:
+                    if agent.get("enabled", True) is False:
+                        continue
+                    for hid in agent.get("notification_handlers", []):
+                        handler_to_agents.setdefault(hid.lower(), []).append(agent)
+                badge_rows = conn.execute(
+                    """
+                    SELECT h.PrimaryId, n.Payload
+                    FROM Notification n
+                    JOIN NotificationHandler h ON n.HandlerId = h.RecordId
+                    WHERE n.Type = 'badge'
+                    """
+                ).fetchall()
+                for primary_id, payload in badge_rows:
+                    cnt = _extract_badge_count(payload)
+                    if cnt > 0:
+                        for ag in handler_to_agents.get(str(primary_id).lower(), []):
+                            aid = ag.get("id", "")
+                            old_cnt, old_ord = self._badge_alerts.get(aid, (0, 0))
+                            if cnt > old_cnt:
+                                self._badge_alerts[aid] = (cnt, old_ord)
+            except Exception:
+                pass
+            finally:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                conn.close()
+
+        for agent in agents:
+            aid = agent.get("id", "")
+            wins = agent_windows.get(aid, [])
+            for w in wins:
+                h = w["hwnd"]
+                title_count = parse_title_unread_count(w.get("title", ""))
+                if title_count:
+                    old_cnt, old_ord = self._title_alerts.get(h, (0, 0))
+                    if title_count > old_cnt:
+                        self._title_alerts[h] = (title_count, old_ord)
+            self.clear_agent(aid, [w["hwnd"] for w in wins])
+
     def _poll_wpn_db(
         self,
         agents: list[dict[str, Any]],
@@ -324,6 +380,7 @@ class NotificationTracker:
         snapshot_order = next(self._event_orders)
         live_hwnds: set[int] = set()
         sole_foreground_agents: set[str] = set()
+        focus_changed_agents: set[str] = set()
         focus_changed = foreground_hwnd != self._foreground_hwnd
         self._foreground_hwnd = foreground_hwnd
         for aid, wins in agent_windows.items():
@@ -349,7 +406,7 @@ class NotificationTracker:
                     if len(wins) == 1:
                         sole_foreground_agents.add(aid)
                     if focus_changed:
-                        self.clear_agent_unattributed(aid)
+                        focus_changed_agents.add(aid)
 
         for states in (self._flashing_hwnds, self._window_toasts, self._title_alerts, self._dismissed_title_counts):
             for h in states.keys() - live_hwnds:
@@ -369,7 +426,7 @@ class NotificationTracker:
                     del self._dismissed_badge_counts[aid]
                 elif cur_badge < dismissed_count:
                     self._dismissed_badge_counts[aid] = cur_badge
-        for aid in sole_foreground_agents:
+        for aid in sole_foreground_agents | focus_changed_agents:
             self.clear_agent_unattributed(aid)
 
         summaries: dict[str, AgentNotificationSummary] = {}

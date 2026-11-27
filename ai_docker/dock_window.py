@@ -10,6 +10,7 @@ from typing import Any
 
 from PySide6.QtCore import (
     QPoint,
+    QRect,
     QRectF,
     QSize,
     Qt,
@@ -40,7 +41,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .config import CONFIG_PATH, PROJECT_ROOT, ConfigLoadError, load_config, save_config
+from .config import (
+    CONFIG_PATH,
+    PROJECT_ROOT,
+    ConfigLoadError,
+    _config_file_lock,
+    load_config,
+    save_config,
+    validate_config,
+)
 from .dialogs import (
     AddAgentDialog,
     DiscoverAgentsDialog,
@@ -48,7 +57,7 @@ from .dialogs import (
     normalize_web_url,
     read_internet_shortcut_url,
 )
-from .discovery import build_agent_from_file
+from .discovery import build_agent_from_file, slugify_id
 from .icons import WebIconLoader, load_agent_icon
 from .launcher import (
     close_hwnd,
@@ -73,7 +82,11 @@ from .notifications import (
     NotificationTracker,
     WindowNotificationState,
 )
-from .taskbar import TaskbarHider
+from .taskbar import (
+    TaskbarHider,
+    is_taskbar_hide_excluded_agent,
+    is_taskbar_hide_excluded_process,
+)
 from .theme import AppleGlassMenu, get_palette, paint_apple_glass
 from .updater import UpdateChecker, UpdateCheckResult, launch_updater_script
 
@@ -226,10 +239,13 @@ class AgentIconButton(QWidget):
         self._reordering = False
         self._suppress_next_release = False
 
-        # Short single-click debounce so double-click opens a new instance without double-firing
+        # Arbiter between single-click and double-click using precise system double-click interval
         self._click_timer = QTimer(self)
+        self._click_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._click_timer.setSingleShot(True)
-        self._click_timer.setInterval(220)
+        app = QApplication.instance()
+        dbl_ms = int(app.styleHints().mouseDoubleClickInterval()) if app is not None else 400
+        self._click_timer.setInterval(max(220, dbl_ms + 15))
         self._click_timer.timeout.connect(lambda: self.clicked.emit(self.agent))
 
         # Smooth magnification animation state
@@ -727,8 +743,8 @@ class TopDockCapsule(QWidget):
 class ProjectWindowRow(QWidget):
     """Clean borderless project window row inside an Apple glass workspace card."""
 
-    clicked = Signal(int, str)
-    right_clicked = Signal(dict, int, QPoint)
+    clicked = Signal(object, str)
+    right_clicked = Signal(dict, object, QPoint)
 
     def __init__(
         self,
@@ -984,13 +1000,82 @@ class WorkspaceCardHeader(QWidget):
         painter.end()
 
 
+class OverflowChipButton(QWidget):
+    """Compact '+N 更多' button opening an AppleGlassMenu for overflowed windows or agents."""
+
+    def __init__(
+        self,
+        label: str,
+        width: int,
+        height: int = 28,
+        theme: str = "dark",
+        on_click: Any = None,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self._label = label
+        self._theme = theme
+        self._hovered = False
+        self._pressed = False
+        self._on_click = on_click
+        self.setFixedSize(width, height)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def enterEvent(self, event) -> None:
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hovered = False
+        self._pressed = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self._pressed = True
+            self.update()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self._pressed = False
+            self.update()
+            if self.rect().contains(event.position().toPoint()) and self._on_click is not None:
+                self._on_click(self.mapToGlobal(QPoint(0, self.height())))
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        pal = get_palette(self._theme)
+        row_rect = QRectF(1.0, 2.0, self.width() - 2.0, self.height() - 4.0)
+        bg = pal["row_press"] if self._pressed else (pal["row_hover"] if self._hovered else pal["row_active"])
+        rpath = QPainterPath()
+        rpath.addRoundedRect(row_rect, 8.0, 8.0)
+        painter.fillPath(rpath, bg)
+        font = QFont("Microsoft YaHei UI", 8)
+        font.setPointSizeF(8.2)
+        font.setWeight(QFont.DemiBold)
+        painter.setFont(font)
+        painter.setPen(pal["accent"] if self._hovered else pal["text_header"])
+        painter.drawText(row_rect, Qt.AlignCenter, self._label)
+        painter.end()
+
+
 class AgentWorkspaceCard(QWidget):
     """Apple frosted glass card grouping all open project windows for one running Agent."""
 
     header_clicked = Signal(dict)
     header_right_clicked = Signal(dict, QPoint)
-    window_clicked = Signal(int, str)
-    window_right_clicked = Signal(dict, int, QPoint)
+    window_clicked = Signal(object, str)
+    window_right_clicked = Signal(dict, object, QPoint)
+    overflow_requested = Signal(dict, list, QPoint)
 
     def __init__(
         self,
@@ -1000,6 +1085,7 @@ class AgentWorkspaceCard(QWidget):
         foreground_hwnd: int,
         notif_summary: AgentNotificationSummary,
         card_width: int = 138,
+        max_rows: int | None = None,
         theme: str = "dark",
         alpha: int = 232,
         parent: QWidget | None = None,
@@ -1033,7 +1119,14 @@ class AgentWorkspaceCard(QWidget):
         header.right_clicked.connect(self.header_right_clicked.emit)
         box.addWidget(header)
 
-        for idx, w in enumerate(windows):
+        visible_windows = windows
+        overflow_windows: list[dict[str, Any]] = []
+        if max_rows is not None and len(windows) > max(1, max_rows):
+            keep = max(1, max_rows - 1)
+            visible_windows = windows[:keep]
+            overflow_windows = windows[keep:]
+
+        for idx, w in enumerate(visible_windows):
             h = int(w["hwnd"])
             row = ProjectWindowRow(
                 agent=agent,
@@ -1049,6 +1142,16 @@ class AgentWorkspaceCard(QWidget):
             row.right_clicked.connect(self.window_right_clicked.emit)
             box.addWidget(row)
 
+        if overflow_windows:
+            more_btn = OverflowChipButton(
+                label=f"+{len(overflow_windows)} 更多窗口",
+                width=inner_w,
+                theme=theme,
+                on_click=lambda gp, ag=agent, ov=overflow_windows: self.overflow_requested.emit(ag, ov, gp),
+                parent=self,
+            )
+            box.addWidget(more_btn)
+
         self.adjustSize()
 
     def paintEvent(self, _event) -> None:
@@ -1063,8 +1166,9 @@ class AgentWorkspaceCard(QWidget):
 class AgentHorizontalStrip(QWidget):
     """Horizontal wrapping frosted-glass strip of project windows aligned next to a vertical icon slot."""
 
-    window_clicked = Signal(int, str)
-    window_right_clicked = Signal(dict, int, QPoint)
+    window_clicked = Signal(object, str)
+    window_right_clicked = Signal(dict, object, QPoint)
+    overflow_requested = Signal(dict, list, QPoint)
 
     def __init__(
         self,
@@ -1074,6 +1178,7 @@ class AgentHorizontalStrip(QWidget):
         notif_summary: AgentNotificationSummary,
         chip_width: int = 106,
         max_cols: int = 4,
+        max_rows: int | None = None,
         theme: str = "dark",
         alpha: int = 232,
         parent: QWidget | None = None,
@@ -1095,7 +1200,16 @@ class AgentHorizontalStrip(QWidget):
         grid.setVerticalSpacing(2)
 
         cols = max(1, int(max_cols))
-        for idx, w in enumerate(windows):
+        visible_windows = windows
+        overflow_windows: list[dict[str, Any]] = []
+        if max_rows is not None:
+            cap = max(1, cols * max(1, int(max_rows)))
+            if len(windows) > cap:
+                keep = max(1, cap - 1)
+                visible_windows = windows[:keep]
+                overflow_windows = windows[keep:]
+
+        for idx, w in enumerate(visible_windows):
             row_idx = idx // cols
             col_idx = idx % cols
             h = int(w["hwnd"])
@@ -1113,6 +1227,17 @@ class AgentHorizontalStrip(QWidget):
             row_widget.clicked.connect(self.window_clicked.emit)
             row_widget.right_clicked.connect(self.window_right_clicked.emit)
             grid.addWidget(row_widget, row_idx, col_idx)
+
+        if overflow_windows:
+            ov_idx = len(visible_windows)
+            more_btn = OverflowChipButton(
+                label=f"+{len(overflow_windows)} 更多",
+                width=chip_width,
+                theme=theme,
+                on_click=lambda gp, ag=agent, ov=overflow_windows: self.overflow_requested.emit(ag, ov, gp),
+                parent=self,
+            )
+            grid.addWidget(more_btn, ov_idx // cols, ov_idx % cols)
 
         self.adjustSize()
 
@@ -1320,6 +1445,8 @@ class AgentDockWindow(QWidget):
         self._collapsed: bool = False
         self._collapsed_anchor: QPoint | None = None
         self._vertical_mirrored: bool = False
+        self._vertical_overflow_agents: list[dict[str, Any]] = []
+        self._visible_vertical_ids: set[str] | None = None
         self._expand_cooldown_until: float = 0.0
         self._menu_open: bool = False
         self._dialog_open: bool = False
@@ -1480,10 +1607,10 @@ class AgentDockWindow(QWidget):
             self._collapse_dock(force=True)
 
     def _expand_dock(self) -> None:
-        self._cancel_auto_collapse()
-        self._expand_cooldown_until = 0.0
         if not self._collapsed:
             return
+        self._cancel_auto_collapse()
+        self._expand_cooldown_until = 0.0
         self._collapsed_anchor = self.pos()
         layout_changed = self._apply_layout_orientation(
             self._vertical_mirror_right(self._collapsed_anchor)
@@ -1509,6 +1636,7 @@ class AgentDockWindow(QWidget):
 
         self.move(self._expanded_pos_for_anchor(self._collapsed_anchor))
         self.update()
+        self._schedule_auto_collapse()
 
     def _reposition_after_rebuild(self, anchor: QPoint) -> None:
         if self._collapsed:
@@ -1518,36 +1646,55 @@ class AgentDockWindow(QWidget):
             self.move(self._expanded_pos_for_anchor(anchor))
 
     def _persist_config(
-        self, *, ui: dict[str, Any] | None = None, agents: list[dict[str, Any]] | None = None
+        self,
+        *,
+        ui: dict[str, Any] | None = None,
+        agents: list[dict[str, Any]] | None = None,
+        mutator: Any = None,
     ) -> bool:
-        candidate = dict(self.config)
-        if ui is not None:
-            candidate["ui"] = {**self.config["ui"], **ui}
-        if agents is not None:
-            candidate["agents"] = agents
         try:
-            save_config(candidate)
-        except OSError as exc:
+            with _config_file_lock(CONFIG_PATH):
+                try:
+                    current = load_config()
+                except FileNotFoundError:
+                    current = {"ui": dict(self.config.get("ui", {})), "agents": list(self.config.get("agents", []))}
+                if mutator is not None:
+                    candidate = mutator(current)
+                else:
+                    candidate = dict(current)
+                    if ui is not None:
+                        candidate["ui"] = {**current.get("ui", {}), **ui}
+                    if agents is not None:
+                        candidate["agents"] = agents
+                candidate = validate_config(candidate)
+                save_config(candidate)
+        except (OSError, TimeoutError, ConfigLoadError) as exc:
             QMessageBox.warning(
                 self,
                 "AI docker 配置保存失败",
-                f"无法写入 agents.json（可能正被其他程序占用）：\n{exc}",
+                f"无法写入 agents.json（可能正被其他程序占用或校验失败）：\n{exc}",
             )
             return False
         self.config = candidate
-        if agents is not None:
-            for agent in agents:
-                button = self._buttons.get(agent.get("id", ""))
-                if button is not None:
-                    button.agent = agent
+        for agent in candidate.get("agents", []):
+            button = self._buttons.get(agent.get("id", ""))
+            if button is not None:
+                button.agent = agent
+        if agents is not None or mutator is not None:
             self._last_shelf_sig = None
         return True
 
-    def _clamp_expanded_position(self, position: QPoint) -> QPoint:
-        screen = QGuiApplication.screenAt(position + QPoint(24, 24)) or QGuiApplication.primaryScreen()
-        if screen is None:
+    def _screen_geometry_for(self, anchor: QPoint | None = None) -> QRect | None:
+        pt = anchor if anchor is not None else (self._collapsed_anchor or self.pos())
+        screen = QGuiApplication.screenAt(pt + QPoint(24, 24)) or QGuiApplication.primaryScreen()
+        return screen.availableGeometry() if screen is not None else None
+
+    def _clamp_expanded_position(
+        self, position: QPoint, *, anchor: QPoint | None = None
+    ) -> QPoint:
+        geo = self._screen_geometry_for(anchor if anchor is not None else position)
+        if geo is None:
             return position
-        geo = screen.availableGeometry()
         max_x = geo.right() - self.width() + 1
         max_y = geo.bottom() - self.height() + 1
         return QPoint(
@@ -1585,10 +1732,9 @@ class AgentDockWindow(QWidget):
         if not self._is_vertical():
             return False
         pt = anchor if anchor is not None else (self._collapsed_anchor or self.pos())
-        screen = QGuiApplication.screenAt(pt + QPoint(24, 24)) or QGuiApplication.primaryScreen()
-        if screen is None:
+        geo = self._screen_geometry_for(pt)
+        if geo is None:
             return False
-        geo = screen.availableGeometry()
         return (pt.x() + self._orb.width() / 2.0) > geo.center().x()
 
     def _apply_layout_orientation(self, mirror_right: bool | None = None) -> bool:
@@ -1640,20 +1786,18 @@ class AgentDockWindow(QWidget):
     def _expanded_pos_for_anchor(self, anchor: QPoint) -> QPoint:
         if self._is_vertical() and self._vertical_mirrored:
             raw = QPoint(anchor.x() + self._orb.width() - self.width(), anchor.y())
-            return self._clamp_expanded_position(raw)
-        return self._clamp_expanded_position(anchor)
+            return self._clamp_expanded_position(raw, anchor=anchor)
+        return self._clamp_expanded_position(anchor, anchor=anchor)
 
     def _anchor_for_current_pos(self) -> QPoint:
         if self._collapsed or not (self._is_vertical() and self._vertical_mirrored):
             return self.pos()
         return QPoint(self.x() + self.width() - self._orb.width(), self.y())
 
-    def _vertical_max_cols(self, chip_width: int) -> int:
-        pt = self._collapsed_anchor or self.pos()
-        screen = QGuiApplication.screenAt(pt + QPoint(24, 24)) or QGuiApplication.primaryScreen()
-        if screen is None:
+    def _vertical_max_cols(self, chip_width: int, *, anchor: QPoint | None = None) -> int:
+        geo = self._screen_geometry_for(anchor)
+        if geo is None:
             return 4
-        geo = screen.availableGeometry()
         bar_w = self._top_bar.width() or (int(self.config["ui"].get("button_size", 46)) + 26)
         avail_w = geo.width() - bar_w - 36
         cols = (avail_w - 20) // max(1, chip_width + 2)
@@ -1757,27 +1901,27 @@ class AgentDockWindow(QWidget):
         self._top_bar.set_drop_highlight(False)
         self._orb.set_drop_highlight(False)
         exe_files, web_url = self._extract_drop_payload(event.mimeData())
-        agents = list(self.config["agents"])
-        found = False
-        existing_paths = {
-            os.path.normcase(os.path.normpath(agent["path"])): index
-            for index, agent in enumerate(agents)
-            if agent.get("path")
-        }
-        for local in exe_files:
-            new_agent = build_agent_from_file(local, agents)
-            if not new_agent:
-                continue
-            norm = os.path.normcase(os.path.normpath(new_agent["path"]))
-            index = existing_paths.get(norm)
-            if index is None:
-                existing_paths[norm] = len(agents)
-                agents.append(new_agent)
-            elif agents[index].get("enabled", True) is False:
-                agents[index] = {**agents[index], "enabled": True}
-            found = True
+        def _apply_dropped_files(current: dict[str, Any]) -> dict[str, Any]:
+            cur_agents = list(current.get("agents", []))
+            existing_paths = {
+                os.path.normcase(os.path.normpath(agent["path"])): index
+                for index, agent in enumerate(cur_agents)
+                if agent.get("path")
+            }
+            for local in exe_files:
+                new_agent = build_agent_from_file(local, cur_agents)
+                if not new_agent:
+                    continue
+                norm = os.path.normcase(os.path.normpath(new_agent["path"]))
+                index = existing_paths.get(norm)
+                if index is None:
+                    existing_paths[norm] = len(cur_agents)
+                    cur_agents.append(new_agent)
+                elif cur_agents[index].get("enabled", True) is False:
+                    cur_agents[index] = {**cur_agents[index], "enabled": True}
+            return {**current, "agents": cur_agents}
 
-        if found and (agents == self.config["agents"] or self._persist_config(agents=agents)):
+        if exe_files and self._persist_config(mutator=_apply_dropped_files):
             if self._collapsed:
                 self._expand_dock()
             anchor = self._anchor_for_current_pos()
@@ -1848,9 +1992,27 @@ class AgentDockWindow(QWidget):
 
         btn_list: list[AgentIconButton] = []
         slot_map: dict[str, QWidget] = {}
-        for agent in self.config.get("agents", []):
-            if agent.get("enabled", True) is False:
-                continue
+        geo = self._screen_geometry_for(self._collapsed_anchor or self.pos())
+        enabled_agents = [
+            agent for agent in self.config.get("agents", [])
+            if agent.get("enabled", True) is not False
+        ]
+        self._vertical_overflow_agents = []
+        self._visible_vertical_ids = None
+        visible_agents = enabled_agents
+        if is_vert and geo is not None and enabled_agents:
+            bar_overhead = self._top_bar.first_icon_top_offset(16) + self._top_bar._shadow_pad + 14
+            avail_bar_h = max(btn_size, geo.height() - bar_overhead)
+            step_h = btn_size + 4
+            max_slots = max(1, (avail_bar_h + 4) // step_h)
+            if len(enabled_agents) > max_slots:
+                more_btn_h = min(btn_size, 32)
+                keep_slots = max(0, (avail_bar_h - more_btn_h) // step_h)
+                visible_agents = enabled_agents[:keep_slots]
+                self._vertical_overflow_agents = enabled_agents[keep_slots:]
+                self._visible_vertical_ids = {a.get("id", "") for a in visible_agents}
+
+        for agent in visible_agents:
             aid = agent.get("id", "")
             icon = load_agent_icon(
                 agent, force_refresh=force_refresh_icons, theme=theme, resolve_web_icon=self._web_icons.resolve
@@ -1888,6 +2050,21 @@ class AgentDockWindow(QWidget):
             self._buttons[aid] = btn
             btn_list.append(btn)
 
+        if is_vert and self._vertical_overflow_agents:
+            more_btn_h = min(btn_size, 32)
+            ov_list = list(self._vertical_overflow_agents)
+            more_btn = OverflowChipButton(
+                label=f"+{len(ov_list)}",
+                width=btn_size,
+                height=more_btn_h,
+                theme=theme,
+                on_click=lambda gp, ov=ov_list: self._on_overflow_agents_requested(ov, gp),
+                parent=self._top_bar,
+            )
+            more_btn.setToolTip(f"查看其余 {len(ov_list)} 个 Agent")
+            more_btn.show()
+            self._top_bar.row_layout.addWidget(more_btn)
+
         self._top_bar.set_icon_buttons(btn_list)
         self._top_bar.set_slot_widgets(slot_map)
         self._apply_layout_orientation()
@@ -1921,7 +2098,43 @@ class AgentDockWindow(QWidget):
         is_vert = orientation == "vertical"
         btn_size = int(self.config["ui"].get("button_size", 46))
         card_width = int(self.config["ui"].get("window_chip_width", 138))
+        geo = self._screen_geometry_for(self._collapsed_anchor or self.pos())
         max_cols = self._vertical_max_cols(card_width) if is_vert else 0
+        vert_max_rows: int | None = None
+        horiz_max_rows: int | None = None
+        horiz_max_cards: int | None = None
+        if geo is not None:
+            if is_vert:
+                extra_ov_h = (min(btn_size, 32) + 4) if self._vertical_overflow_agents else 0
+                avail_h = max(
+                    btn_size,
+                    geo.height() - self._top_bar.first_icon_top_offset(16) - self._top_bar._shadow_pad - 14 - extra_ov_h,
+                )
+                visible_for_vert = [
+                    ag for ag in agents
+                    if ag.get("enabled", True) is not False
+                    and (self._visible_vertical_ids is None or ag.get("id", "") in self._visible_vertical_ids)
+                ]
+                active_cnt = sum(
+                    1 for ag in visible_for_vert if agent_windows.get(ag.get("id", ""))
+                )
+                enabled_cnt = len(visible_for_vert)
+                idle_cnt = max(0, enabled_cnt - active_cnt)
+                est_h = idle_cnt * btn_size + max(0, enabled_cnt - 1) * 4
+                for ag in visible_for_vert:
+                    wins = agent_windows.get(ag.get("id", ""), [])
+                    if wins:
+                        rows = max(1, (len(wins) + max_cols - 1) // max_cols)
+                        est_h += max(btn_size, rows * 30 + 16)
+                if est_h > avail_h and active_cnt > 0:
+                    active_budget_h = max(btn_size * active_cnt, avail_h - idle_cnt * btn_size - max(0, enabled_cnt - 1) * 4)
+                    per_strip_h = active_budget_h // active_cnt
+                    vert_max_rows = max(1, (per_strip_h - 16) // 30)
+            else:
+                avail_h = max(120, geo.height() - (self._top_bar.height() or 60) - 24)
+                horiz_max_rows = max(2, (avail_h - 46) // 30)
+                usable_w = max(84, geo.width() - 8)
+                horiz_max_cards = max(1, usable_w // max(1, card_width + 12))
 
         sig_cards = []
         enabled_agents: list[dict[str, Any]] = []
@@ -1930,8 +2143,10 @@ class AgentDockWindow(QWidget):
             for ag in agents:
                 if ag.get("enabled", True) is False:
                     continue
-                enabled_agents.append(ag)
                 aid = ag.get("id", "")
+                if is_vert and self._visible_vertical_ids is not None and aid not in self._visible_vertical_ids:
+                    continue
+                enabled_agents.append(ag)
                 wins = agent_windows.get(aid, [])
                 if not wins:
                     if is_vert:
@@ -1957,9 +2172,13 @@ class AgentDockWindow(QWidget):
             theme,
             orientation,
             self._vertical_mirrored if is_vert else False,
+            len(self._vertical_overflow_agents) if is_vert else 0,
             card_width,
             btn_size,
             max_cols,
+            vert_max_rows,
+            horiz_max_rows,
+            horiz_max_cards,
             bool(show_list),
             tuple(sig_cards),
         )
@@ -1999,12 +2218,14 @@ class AgentDockWindow(QWidget):
                         notif_summary=summary,
                         chip_width=card_width,
                         max_cols=max_cols,
+                        max_rows=vert_max_rows,
                         theme=theme,
                         alpha=alpha,
                         parent=self._shelf,
                     )
                     strip.window_clicked.connect(self._on_window_chip_clicked)
                     strip.window_right_clicked.connect(self._on_window_chip_right_clicked)
+                    strip.overflow_requested.connect(self._on_overflow_windows_requested)
                     row_h = max(btn_size, strip.sizeHint().height())
                     slot_heights[aid] = row_h
                     row_box = QWidget(self._shelf)
@@ -2031,7 +2252,20 @@ class AgentDockWindow(QWidget):
 
         if active_agents:
             alpha = self._capsule_alpha()
-            for ag in active_agents:
+            visible_cards = active_agents
+            overflow_agents: list[dict[str, Any]] = []
+            more_card_w = card_width
+            if horiz_max_cards is not None and len(active_agents) > horiz_max_cards:
+                usable_w = max(84, (geo.width() - 8) if geo is not None else card_width)
+                full_card_w = card_width + 12
+                more_card_w = min(card_width, max(84, usable_w // 2))
+                keep_cards = max(0, (usable_w - more_card_w) // max(1, full_card_w))
+                if keep_cards == 0:
+                    more_card_w = min(card_width, max(84, usable_w - 4))
+                visible_cards = active_agents[:keep_cards]
+                overflow_agents = active_agents[keep_cards:]
+
+            for ag in visible_cards:
                 aid = ag.get("id", "")
                 wins = agent_windows.get(aid, [])
                 icon = self._icons.get(aid) or self._default_app_icon
@@ -2043,6 +2277,7 @@ class AgentDockWindow(QWidget):
                     foreground_hwnd=foreground_hwnd,
                     notif_summary=summary,
                     card_width=card_width,
+                    max_rows=horiz_max_rows,
                     theme=theme,
                     alpha=alpha,
                     parent=self._shelf,
@@ -2051,8 +2286,22 @@ class AgentDockWindow(QWidget):
                 card.header_right_clicked.connect(self._on_agent_right_clicked)
                 card.window_clicked.connect(self._on_window_chip_clicked)
                 card.window_right_clicked.connect(self._on_window_chip_right_clicked)
+                card.overflow_requested.connect(self._on_overflow_windows_requested)
                 card.show()
                 self._shelf_layout.addWidget(card, 0, Qt.AlignTop)
+
+            if overflow_agents:
+                more_card = OverflowChipButton(
+                    label=f"+{len(overflow_agents)} 更多 Agent",
+                    width=more_card_w,
+                    height=34,
+                    theme=theme,
+                    on_click=lambda gp, ov=overflow_agents: self._on_overflow_agents_requested(ov, gp),
+                    parent=self._shelf,
+                )
+                more_card.show()
+                self._shelf_layout.addWidget(more_card, 0, Qt.AlignTop)
+
             self._shelf_layout.activate()
             self._shelf.adjustSize()
             if not self._collapsed:
@@ -2141,10 +2390,47 @@ class AgentDockWindow(QWidget):
         notif_map = self._notif_tracker.poll(agents, self._agent_windows, fg_hwnd)
         self._last_notif_map = notif_map
 
+        target_hwnds: set[int] = set()
+        released_hwnds: set[int] = set()
+        if hide_enabled:
+            visible_vert_ids = self._visible_vertical_ids if self._is_vertical() else None
+            for agent in agents:
+                if agent.get("enabled", True) is False:
+                    continue
+                aid = agent.get("id", "")
+                wins = self._agent_windows.get(aid, [])
+                agent_released = (
+                    agent.get("hide_from_taskbar", True) is False
+                    or is_taskbar_hide_excluded_agent(agent)
+                    or (visible_vert_ids is not None and aid not in visible_vert_ids)
+                )
+                for w in wins:
+                    win_excluded = is_taskbar_hide_excluded_process(
+                        w.get("process") or w.get("process_path")
+                    )
+                    if agent_released or win_excluded:
+                        released_hwnds.add(w["hwnd"])
+                    else:
+                        target_hwnds.add(w["hwnd"])
+            target_hwnds -= released_hwnds
+
         for aid, btn in self._buttons.items():
             wins = self._agent_windows.get(aid, [])
             summary = notif_map.get(aid, AgentNotificationSummary())
-            released = (not hide_enabled) or (btn.agent.get("hide_from_taskbar", True) is False)
+            excluded = is_taskbar_hide_excluded_agent(btn.agent) or (
+                bool(wins)
+                and all(
+                    is_taskbar_hide_excluded_process(w.get("process") or w.get("process_path"))
+                    for w in wins
+                )
+            )
+            shared_released = bool(wins) and all(w["hwnd"] in released_hwnds for w in wins)
+            released = (
+                (not hide_enabled)
+                or (btn.agent.get("hide_from_taskbar", True) is False)
+                or excluded
+                or shared_released
+            )
             btn.update_state(
                 window_count=len(wins),
                 show_dot=show_dot,
@@ -2175,15 +2461,6 @@ class AgentDockWindow(QWidget):
             self.update()
 
         if hide_enabled:
-            target_hwnds: set[int] = set()
-            for agent in agents:
-                if agent.get("enabled", True) is False:
-                    continue
-                if agent.get("hide_from_taskbar", True) is False:
-                    continue
-                aid = agent.get("id", "")
-                for w in self._agent_windows.get(aid, []):
-                    target_hwnds.add(w["hwnd"])
             self._taskbar_hider.sync_hidden_windows(target_hwnds)
         else:
             if self._taskbar_hider.hidden_count > 0:
@@ -2214,6 +2491,8 @@ class AgentDockWindow(QWidget):
                 self._notif_tracker.clear_window(focused_hwnd)
             self._notif_tracker.clear_agent_unattributed(aid)
             QTimer.singleShot(180, self._refresh_state)
+        elif msg.startswith("focus_deferred:"):
+            QTimer.singleShot(180, self._refresh_state)
         else:
             wins = self._agent_windows.get(aid, [])
             if len(wins) <= 1:
@@ -2230,14 +2509,13 @@ class AgentDockWindow(QWidget):
             QTimer.singleShot(500, self._refresh_state)
 
     def _on_window_chip_clicked(self, hwnd: int, agent_id: str) -> None:
-        self._notif_tracker.clear_window(hwnd)
-        self._notif_tracker.clear_agent_unattributed(agent_id)
-        focus_hwnd(hwnd)
+        if focus_hwnd(hwnd):
+            self._notif_tracker.clear_window(hwnd)
+            self._notif_tracker.clear_agent_unattributed(agent_id)
         QTimer.singleShot(180, self._refresh_state)
 
     def _on_window_chip_close_requested(self, hwnd: int, agent_id: str) -> None:
         if close_hwnd(hwnd):
-            self._notif_tracker.clear_window(hwnd)
             QTimer.singleShot(250, self._refresh_state)
         else:
             QMessageBox.warning(
@@ -2246,6 +2524,76 @@ class AgentDockWindow(QWidget):
                 "无法关闭该窗口（窗口可能已关闭，或目标进程权限更高）。",
             )
             QTimer.singleShot(150, self._refresh_state)
+
+    def _on_overflow_windows_requested(
+        self, agent: dict[str, Any], windows: list[dict[str, Any]], global_pos: QPoint
+    ) -> None:
+        menu = AppleGlassMenu(theme=self._theme(), alpha=self._capsule_alpha(), parent=self)
+        aid = agent.get("id", "")
+        notif_summary = self._last_notif_map.get(aid, AgentNotificationSummary())
+        for w in windows:
+            hwnd = int(w["hwnd"])
+            proj = w.get("project") or w.get("title") or agent.get("name") or "窗口"
+            st = notif_summary.by_hwnd.get(hwnd)
+            suffix = f" ({st.count})" if st and st.count > 0 else (" (!)" if st and st.has_alert else "")
+            sub = menu.addMenu(self._menu_text(f"{proj}{suffix}"))
+            act_focus = sub.addAction("切换到该窗口")
+            act_focus.triggered.connect(lambda checked=False, h=hwnd, a=aid: self._on_window_chip_clicked(h, a))
+            if hwnd in notif_summary.by_hwnd:
+                act_clear = sub.addAction("清除该窗口通知角标")
+                act_clear.triggered.connect(
+                    lambda checked=False, h=hwnd: (self._notif_tracker.clear_window(h), self._refresh_state())
+                )
+            act_close = sub.addAction("关闭该窗口")
+            act_close.setProperty("destructive", True)
+            act_close.triggered.connect(
+                lambda checked=False, h=hwnd, a=aid: self._on_window_chip_close_requested(h, a)
+            )
+        self._menu_open = True
+        self._cancel_auto_collapse()
+        try:
+            menu.exec(global_pos)
+        finally:
+            self._menu_open = False
+            menu.deleteLater()
+            self._schedule_auto_collapse()
+
+    def _on_overflow_agents_requested(
+        self, agents: list[dict[str, Any]], global_pos: QPoint
+    ) -> None:
+        menu = AppleGlassMenu(theme=self._theme(), alpha=self._capsule_alpha(), parent=self)
+        for ag in agents:
+            aid = ag.get("id", "")
+            wins = self._agent_windows.get(aid, [])
+            notif_summary = self._last_notif_map.get(aid, AgentNotificationSummary())
+            cnt_txt = f" ({len(wins)})" if wins else ""
+            alert_txt = " (!)" if notif_summary.has_alert else ""
+            sub = menu.addMenu(self._menu_text(f"{ag.get('name', aid)}{cnt_txt}{alert_txt}"))
+            act_open = sub.addAction("打开 / 聚焦" if wins else "启动该 Agent")
+            act_open.triggered.connect(lambda checked=False, item=ag: self._on_agent_clicked(item))
+            for w in wins:
+                hwnd = int(w["hwnd"])
+                proj = w.get("project") or w.get("title") or "窗口"
+                st = notif_summary.by_hwnd.get(hwnd)
+                suffix = f" ({st.count})" if st and st.count > 0 else (" (!)" if st and st.has_alert else "")
+                w_sub = sub.addMenu(self._menu_text(f"{proj}{suffix}"))
+                act_focus = w_sub.addAction("切换到该窗口")
+                act_focus.triggered.connect(
+                    lambda checked=False, h=hwnd, a=aid: self._on_window_chip_clicked(h, a)
+                )
+                act_close = w_sub.addAction("关闭该窗口")
+                act_close.setProperty("destructive", True)
+                act_close.triggered.connect(
+                    lambda checked=False, h=hwnd, a=aid: self._on_window_chip_close_requested(h, a)
+                )
+        self._menu_open = True
+        self._cancel_auto_collapse()
+        try:
+            menu.exec(global_pos)
+        finally:
+            self._menu_open = False
+            menu.deleteLater()
+            self._schedule_auto_collapse()
 
     def _on_agent_right_clicked(self, agent: dict[str, Any], global_pos: QPoint) -> None:
         self._show_context_menu(global_pos, agent=agent, target_hwnd=None)
@@ -2276,7 +2624,7 @@ class AgentDockWindow(QWidget):
             if target_hwnd in notif_summary.by_hwnd:
                 act_clear_win = menu.addAction("清除该窗口通知角标")
                 act_clear_win.triggered.connect(
-                    lambda: (self._notif_tracker.clear_window(target_hwnd, aid), self._refresh_state())
+                    lambda checked=False, h=target_hwnd: (self._notif_tracker.clear_window(h), self._refresh_state())
                 )
             act_close = menu.addAction("关闭该窗口")
             act_close.setProperty("destructive", True)
@@ -2297,9 +2645,13 @@ class AgentDockWindow(QWidget):
         new_inst = menu.addAction(f"新开实例：{safe_name}")
         new_inst.triggered.connect(lambda: launch_agent(agent, focus_existing=False))
 
+        is_excluded = is_taskbar_hide_excluded_agent(agent)
         is_released = agent.get("hide_from_taskbar", True) is False
         global_hide = bool(self.config["ui"].get("hide_from_taskbar", True))
-        if is_released:
+        if is_excluded:
+            rel_act = menu.addAction(f"保留在系统任务栏：{safe_name}（不隐藏 Chrome）")
+            rel_act.setEnabled(False)
+        elif is_released:
             rel_act = menu.addAction(f"重新收进悬浮窗：{safe_name}")
             if not global_hide:
                 rel_act.setText(f"重新收进悬浮窗：{safe_name}（全局隐藏已关）")
@@ -2431,7 +2783,11 @@ class AgentDockWindow(QWidget):
             show_all_act.triggered.connect(self._show_all_agents)
 
         enabled_agents = [a for a in all_agents if a.get("enabled", True) is not False]
-        released_count = sum(1 for a in enabled_agents if a.get("hide_from_taskbar", True) is False)
+        released_count = sum(
+            1
+            for a in enabled_agents
+            if not is_taskbar_hide_excluded_agent(a) and a.get("hide_from_taskbar", True) is False
+        )
         rel_title = (
             f"释放指定 Agent 到任务栏（已释放 {released_count} 个）"
             if released_count > 0
@@ -2441,6 +2797,12 @@ class AgentDockWindow(QWidget):
         for item_agent in enabled_agents:
             item_id = item_agent.get("id", "")
             item_name = item_agent.get("name", item_id)
+            if is_taskbar_hide_excluded_agent(item_agent):
+                act = rel_menu.addAction(self._menu_text(f"{item_name}（Chrome 保留在任务栏）"))
+                act.setCheckable(True)
+                act.setChecked(True)
+                act.setEnabled(False)
+                continue
             is_rel = item_agent.get("hide_from_taskbar", True) is False
             act = rel_menu.addAction(self._menu_text(item_name))
             act.setCheckable(True)
@@ -2565,7 +2927,52 @@ class AgentDockWindow(QWidget):
         try:
             dlg = DiscoverAgentsDialog(self.config.get("agents", []), theme=self._theme(), parent=self)
             if dlg.exec() and dlg.selected_agents:
-                if not self._persist_config(agents=[*self.config["agents"], *dlg.selected_agents]):
+                def _append_discovered(current: dict[str, Any]) -> dict[str, Any]:
+                    cur_agents = list(current.get("agents", []))
+                    cur_ids = {a.get("id", "") for a in cur_agents}
+                    existing_paths = {
+                        os.path.normcase(os.path.normpath(a.get("path", "")))
+                        for a in cur_agents
+                        if a.get("path")
+                    }
+                    existing_aumids = {
+                        (a.get("aumid") or "").lower()
+                        for a in cur_agents
+                        if a.get("aumid")
+                    }
+                    existing_cmds = {
+                        (a.get("command") or "").strip().lower()
+                        for a in cur_agents
+                        if a.get("type") == "cli" and a.get("command")
+                    }
+                    to_add: list[dict[str, Any]] = []
+                    for item in dlg.selected_agents:
+                        atype = item.get("type", "exe")
+                        if atype == "exe" and item.get("path"):
+                            norm_p = os.path.normcase(os.path.normpath(item["path"]))
+                            if norm_p in existing_paths:
+                                continue
+                            existing_paths.add(norm_p)
+                        elif atype == "msix" and item.get("aumid"):
+                            aumid_low = item["aumid"].lower()
+                            if aumid_low in existing_aumids:
+                                continue
+                            existing_aumids.add(aumid_low)
+                        elif atype == "cli" and item.get("command"):
+                            cmd_low = item["command"].strip().lower()
+                            if cmd_low in existing_cmds:
+                                continue
+                            existing_cmds.add(cmd_low)
+                        entry = dict(item)
+                        aid = entry.get("id", "")
+                        if not aid or aid in cur_ids:
+                            aid = slugify_id(entry.get("name") or aid or "agent", cur_ids)
+                            entry["id"] = aid
+                        cur_ids.add(aid)
+                        to_add.append(entry)
+                    return {**current, "agents": [*cur_agents, *to_add]}
+
+                if not self._persist_config(mutator=_append_discovered):
                     return
                 if self._collapsed:
                     self._expand_dock()
@@ -2592,7 +2999,17 @@ class AgentDockWindow(QWidget):
                 initial_url=initial_url,
             )
             if dlg.exec() and dlg.created_agent:
-                if not self._persist_config(agents=[*self.config["agents"], dlg.created_agent]):
+                created = dict(dlg.created_agent)
+                def _append_created(current: dict[str, Any]) -> dict[str, Any]:
+                    cur_agents = list(current.get("agents", []))
+                    cur_ids = {a.get("id", "") for a in cur_agents}
+                    entry = dict(created)
+                    aid = entry.get("id", "")
+                    if not aid or aid in cur_ids:
+                        entry["id"] = slugify_id(entry.get("name") or aid or "agent", cur_ids)
+                    return {**current, "agents": [*cur_agents, entry]}
+
+                if not self._persist_config(mutator=_append_created):
                     return
                 if self._collapsed:
                     self._expand_dock()
@@ -2649,25 +3066,23 @@ class AgentDockWindow(QWidget):
         self._reposition_after_rebuild(anchor)
 
     def _move_agent_to_visible_index(self, agent_id: str, new_visible_idx: int) -> None:
-        agents = list(self.config["agents"])
-        visible_slots = [i for i, a in enumerate(agents) if a.get("enabled", True) is not False]
-        visible_items = [agents[i] for i in visible_slots]
+        def _reorder(current: dict[str, Any]) -> dict[str, Any]:
+            cur_agents = list(current.get("agents", []))
+            visible_slots = [i for i, a in enumerate(cur_agents) if a.get("enabled", True) is not False]
+            visible_items = [cur_agents[i] for i in visible_slots]
+            cur_vis_idx = next((i for i, a in enumerate(visible_items) if a.get("id") == agent_id), -1)
+            if cur_vis_idx < 0:
+                return current
+            clamped = max(0, min(len(visible_items) - 1, int(new_visible_idx)))
+            if clamped == cur_vis_idx:
+                return current
+            moved = visible_items.pop(cur_vis_idx)
+            visible_items.insert(clamped, moved)
+            for slot_idx, item in zip(visible_slots, visible_items):
+                cur_agents[slot_idx] = item
+            return {**current, "agents": cur_agents}
 
-        cur_vis_idx = next(
-            (i for i, a in enumerate(visible_items) if a.get("id") == agent_id), -1
-        )
-        if cur_vis_idx < 0:
-            return
-        clamped = max(0, min(len(visible_items) - 1, int(new_visible_idx)))
-        if clamped == cur_vis_idx:
-            return
-
-        moved = visible_items.pop(cur_vis_idx)
-        visible_items.insert(clamped, moved)
-        for slot_idx, item in zip(visible_slots, visible_items):
-            agents[slot_idx] = item
-
-        if not self._persist_config(agents=agents):
+        if not self._persist_config(mutator=_reorder):
             return
         anchor = self._anchor_for_current_pos()
         self._rebuild_dock(force_refresh_icons=False)
@@ -2683,19 +3098,20 @@ class AgentDockWindow(QWidget):
         self._move_agent_to_visible_index(agent_id, cur_idx + delta)
 
     def _set_agent_visible(self, agent_id: str, visible: bool) -> None:
-        agents = list(self.config["agents"])
-        if not visible:
-            visible_count = sum(1 for a in agents if a.get("enabled", True) is not False)
-            if visible_count <= 1:
-                return
-        changed = False
-        for index, a in enumerate(agents):
-            if a.get("id") == agent_id:
-                if (a.get("enabled", True) is not False) != visible:
-                    agents[index] = {**a, "enabled": visible}
-                    changed = True
-                break
-        if not changed or not self._persist_config(agents=agents):
+        def _set_vis(current: dict[str, Any]) -> dict[str, Any]:
+            cur_agents = list(current.get("agents", []))
+            if not visible:
+                visible_count = sum(1 for a in cur_agents if a.get("enabled", True) is not False)
+                if visible_count <= 1:
+                    return current
+            for index, a in enumerate(cur_agents):
+                if a.get("id") == agent_id:
+                    if (a.get("enabled", True) is not False) != visible:
+                        cur_agents[index] = {**a, "enabled": visible}
+                    break
+            return {**current, "agents": cur_agents}
+
+        if not self._persist_config(mutator=_set_vis):
             return
         anchor = self._anchor_for_current_pos()
         self._rebuild_dock(force_refresh_icons=False)
@@ -2703,9 +3119,14 @@ class AgentDockWindow(QWidget):
         self._reposition_after_rebuild(anchor)
 
     def _show_all_agents(self) -> None:
-        previous = self.config["agents"]
-        agents = [{**agent, "enabled": True} if agent.get("enabled") is False else agent for agent in previous]
-        if agents == previous or not self._persist_config(agents=agents):
+        def _show_all(current: dict[str, Any]) -> dict[str, Any]:
+            cur_agents = [
+                {**agent, "enabled": True} if agent.get("enabled") is False else agent
+                for agent in current.get("agents", [])
+            ]
+            return {**current, "agents": cur_agents}
+
+        if not self._persist_config(mutator=_show_all):
             return
         anchor = self._anchor_for_current_pos()
         self._rebuild_dock(force_refresh_icons=False)
@@ -2725,34 +3146,36 @@ class AgentDockWindow(QWidget):
 
     def _set_agent_released(self, agent_id: str, released: bool) -> None:
         """Release a specific Agent back to the native Windows taskbar, or reclaim it into the dock."""
-        agents = list(self.config["agents"])
-        for index, agent in enumerate(agents):
-            if agent.get("id") != agent_id:
-                continue
-            was_released = agent.get("hide_from_taskbar", True) is False
-            if was_released != released:
-                agents[index] = {**agent, "hide_from_taskbar": not released}
-                if self._persist_config(agents=agents):
-                    self._refresh_state()
-            return
+        def _set_rel(current: dict[str, Any]) -> dict[str, Any]:
+            cur_agents = list(current.get("agents", []))
+            for index, agent in enumerate(cur_agents):
+                if agent.get("id") == agent_id:
+                    if (agent.get("hide_from_taskbar", True) is False) != released:
+                        cur_agents[index] = {**agent, "hide_from_taskbar": not released}
+                    break
+            return {**current, "agents": cur_agents}
+
+        if self._persist_config(mutator=_set_rel):
+            self._refresh_state()
 
     def _reclaim_all_released(self) -> None:
-        previous = self.config["agents"]
-        agents = [
-            {**agent, "hide_from_taskbar": True} if agent.get("hide_from_taskbar") is False else agent
-            for agent in previous
-        ]
-        if agents != previous and self._persist_config(agents=agents):
+        def _reclaim(current: dict[str, Any]) -> dict[str, Any]:
+            cur_agents = [
+                {**agent, "hide_from_taskbar": True} if agent.get("hide_from_taskbar") is False else agent
+                for agent in current.get("agents", [])
+            ]
+            return {**current, "agents": cur_agents}
+
+        if self._persist_config(mutator=_reclaim):
             self._refresh_state()
 
     def _toggle_focus_existing(self, checked: bool) -> None:
         self._persist_config(ui={"focus_existing": bool(checked)})
 
     def _clear_all_notifications(self) -> None:
-        for agent in self.config.get("agents", []):
-            aid = agent.get("id", "")
-            wins = self._agent_windows.get(aid, [])
-            self._notif_tracker.clear_agent(aid, [w["hwnd"] for w in wins])
+        agents = self.config.get("agents", [])
+        self._agent_windows = get_agent_window_map(agents)
+        self._notif_tracker.clear_all(agents, self._agent_windows)
         self._refresh_state()
 
     def _reload_all(

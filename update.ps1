@@ -42,16 +42,29 @@ function Invoke-Native {
         [string]$FilePath,
         [string[]]$Arguments
     )
+    $stderrFile = [IO.Path]::GetTempFileName()
     $prevEap = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        $lines = & $FilePath @Arguments 2>&1
+        $lines = & $FilePath @Arguments 2>$stderrFile
         $code = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $prevEap
     }
-    $text = (($lines | ForEach-Object { $_.ToString() }) -join "`n").Trim()
-    return @{ Code = $code; Output = $text }
+    $stdoutText = (($lines | ForEach-Object { $_.ToString() }) -join "`n").Trim()
+    $stderrText = ""
+    try {
+        if (Test-Path -LiteralPath $stderrFile) {
+            $rawErr = Get-Content -LiteralPath $stderrFile -Raw -ErrorAction SilentlyContinue
+            if ($rawErr) {
+                $stderrText = $rawErr.Trim()
+            }
+        }
+    } finally {
+        Remove-Item -LiteralPath $stderrFile -Force -ErrorAction SilentlyContinue
+    }
+    $combinedText = (@($stdoutText, $stderrText | Where-Object { $_ }) -join "`n").Trim()
+    return @{ Code = $code; Output = $stdoutText; Error = $stderrText; Combined = $combinedText }
 }
 
 function Invoke-Git {
@@ -60,15 +73,53 @@ function Invoke-Git {
 }
 
 function Start-AiDocker {
+    param([switch]$PreferPythonFallback)
     $launcherExe = Join-Path $Root "AI docker.exe"
-    if (Test-Path $launcherExe) {
-        Start-Process -FilePath $launcherExe -WorkingDirectory $Root
-        return
-    }
     $pythonw = Join-Path $Root ".venv\Scripts\pythonw.exe"
     $entry = Join-Path $Root "start_dock.pyw"
-    if ((Test-Path $pythonw) -and (Test-Path $entry)) {
-        Start-Process -FilePath $pythonw -ArgumentList "`"$entry`"" -WorkingDirectory $Root
+    if ((-not $PreferPythonFallback) -and (Test-Path -LiteralPath $launcherExe)) {
+        if (-not ((Test-Path -LiteralPath $pythonw) -and (Test-Path -LiteralPath $entry))) {
+            throw "AI docker.exe 缺少运行所需的 .venv\Scripts\pythonw.exe 或 start_dock.pyw，无法重启悬浮窗。"
+        }
+        $proc = Start-Process -FilePath $launcherExe -WorkingDirectory $Root -PassThru
+        if (-not $proc) {
+            throw "启动器 AI docker.exe 拉起失败。"
+        }
+        if ($proc.WaitForExit(500) -and $proc.ExitCode -ne 0) {
+            throw "启动器 AI docker.exe 退出异常（退出码 $($proc.ExitCode)），未能重启悬浮窗。"
+        }
+        return
+    }
+    if ((Test-Path -LiteralPath $pythonw) -and (Test-Path -LiteralPath $entry)) {
+        $proc = Start-Process -FilePath $pythonw -ArgumentList "`"$entry`"" -WorkingDirectory $Root -PassThru
+        if (-not $proc) {
+            throw "Python 入口 start_dock.pyw 拉起失败。"
+        }
+        if ($proc.WaitForExit(300) -and $proc.ExitCode -ne 0) {
+            throw "Python 入口 start_dock.pyw 退出异常（退出码 $($proc.ExitCode)），未能重启悬浮窗。"
+        }
+        return
+    }
+    throw "未找到可用的 AI docker 启动器或 Python 入口，无法重启悬浮窗。"
+}
+
+function Test-InstanceMutexHeld {
+    param([string]$Name)
+    if (-not $Name) {
+        return $false
+    }
+    $existing = $null
+    try {
+        if ([System.Threading.Mutex]::TryOpenExisting($Name, [ref]$existing)) {
+            return $true
+        }
+        return $false
+    } catch [System.UnauthorizedAccessException] {
+        return $true
+    } finally {
+        if ($existing) {
+            $existing.Dispose()
+        }
     }
 }
 
@@ -119,56 +170,105 @@ public static class AiDockerWin32 {
     }
     $property = "AI docker install $hash"
     $entryPaths = @((Join-Path $Root 'start_dock.pyw'), (Join-Path $Root 'main.py'))
-    $hwnd = [IntPtr]::Zero
-    $unverifiedWindow = $false
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
     while ($true) {
-        $hwnd = [AiDockerWin32]::FindWindowExW([IntPtr]::Zero, $hwnd, [IntPtr]::Zero, "AI docker")
-        if ($hwnd -eq [IntPtr]::Zero) { break }
-        [uint32]$dockPid = 0
-        [void][AiDockerWin32]::GetWindowThreadProcessId($hwnd, [ref]$dockPid)
-        if ($dockPid -eq 0) { continue }
-        if ([AiDockerWin32]::GetPropW($hwnd, $property) -eq [IntPtr]::Zero) {
-            $procInfo = Get-CimInstance Win32_Process -Filter "ProcessId=$dockPid" -ErrorAction SilentlyContinue
-            $argv = if ($procInfo.CommandLine) { @([AiDockerWin32]::ParseCommandLine($procInfo.CommandLine)) }
-            if ($argv.Count -lt 2 -or [IO.Path]::GetFileName($argv[0]) -notmatch '^pythonw?\.exe$' -or
-                -not ([IO.Path]::IsPathRooted($argv[1])) -or
-                [IO.Path]::GetFullPath($argv[1]) -notin $entryPaths) {
-                $unverifiedWindow = $true
-                continue
+        $hwnd = [IntPtr]::Zero
+        $unverifiedWindow = $false
+        $closedAny = $false
+        while ($true) {
+            $hwnd = [AiDockerWin32]::FindWindowExW([IntPtr]::Zero, $hwnd, [IntPtr]::Zero, "AI docker")
+            if ($hwnd -eq [IntPtr]::Zero) { break }
+            [uint32]$dockPid = 0
+            [void][AiDockerWin32]::GetWindowThreadProcessId($hwnd, [ref]$dockPid)
+            if ($dockPid -eq 0) { continue }
+            if ([AiDockerWin32]::GetPropW($hwnd, $property) -eq [IntPtr]::Zero) {
+                $procInfo = Get-CimInstance Win32_Process -Filter "ProcessId=$dockPid" -ErrorAction SilentlyContinue
+                $argv = if ($procInfo.CommandLine) { @([AiDockerWin32]::ParseCommandLine($procInfo.CommandLine)) }
+                if ($argv.Count -ge 2 -and [IO.Path]::GetFileName($argv[0]) -match '^pythonw?\.exe$' -and
+                    [IO.Path]::IsPathRooted($argv[1]) -and
+                    ([IO.Path]::GetFileName($argv[1]) -in @('start_dock.pyw', 'main.py'))) {
+                    if ([IO.Path]::GetFullPath($argv[1]) -notin $entryPaths) {
+                        continue
+                    }
+                } else {
+                    $unverifiedWindow = $true
+                    continue
+                }
             }
-        }
 
-        $process = Get-Process -Id $dockPid -ErrorAction SilentlyContinue
-        if (-not $process) { continue }
-        try {
-            [void]$process.Handle
-            Write-Info "Closing running AI docker (PID $dockPid)..."
-            if (-not [AiDockerWin32]::PostMessageW($hwnd, [AiDockerWin32]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero) -or
-                -not $process.WaitForExit(30000)) {
-                throw "无法优雅关闭正在运行的 AI docker（PID $dockPid），请先右键退出后再运行更新。"
+            $process = Get-Process -Id $dockPid -ErrorAction SilentlyContinue
+            if (-not $process) { continue }
+            try {
+                [void]$process.Handle
+                Write-Info "Closing running AI docker (PID $dockPid)..."
+                if (-not [AiDockerWin32]::PostMessageW($hwnd, [AiDockerWin32]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero) -or
+                    -not $process.WaitForExit(30000)) {
+                    throw "无法优雅关闭正在运行的 AI docker（PID $dockPid），请先右键退出后再运行更新。"
+                }
+                if (-not $NoLaunch) {
+                    $script:shouldRestoreOnFail = $true
+                }
+                $closedAny = $true
+                break
+            } finally {
+                $process.Dispose()
             }
-            $script:shouldRestoreOnFail = $true
-            return
-        } finally {
-            $process.Dispose()
         }
-    }
-    if ($unverifiedWindow) {
-        throw "找到了其他安装或来源不明的 AI docker 窗口。请关闭正在运行的 Dock 后再更新。"
+        if ($unverifiedWindow) {
+            throw "找到了其他安装或来源不明的 AI docker 窗口。请关闭正在运行的 Dock 后再更新。"
+        }
+        if (-not $closedAny -and -not (Test-InstanceMutexHeld $script:instanceMutexName)) {
+            return
+        }
+        if ([DateTime]::UtcNow -ge $deadline) {
+            throw "检测到同目录 AI docker 正在启动或尚未释放实例锁，请稍后重试更新。"
+        }
+        Start-Sleep -Milliseconds 100
     }
 }
 
 $shouldRestoreOnFail = $false
 $runtimeReady = $true
 $updateLock = $null
+$updateMutex = $null
+$hasUpdateMutex = $false
+$instanceMutexName = $null
 $pendingSyncPath = $null
 $createdPendingSync = $false
 $targetRef = $null
+$launcherBuildFailed = $false
+
+function Release-UpdateMutex {
+    if ($script:hasUpdateMutex -and $script:updateMutex) {
+        try { $script:updateMutex.ReleaseMutex() } catch { }
+        $script:updateMutex.Dispose()
+        $script:updateMutex = $null
+        $script:hasUpdateMutex = $false
+    }
+}
 
 try {
     Set-Location -LiteralPath $Root
 
-    # 1. Wait for exiting AI docker instance (or gracefully close running instance in CLI mode)
+    $shaRoot = [Security.Cryptography.SHA256]::Create()
+    try {
+        $rootBytes = [Text.Encoding]::UTF8.GetBytes([IO.Path]::GetFullPath($Root).ToLowerInvariant())
+        $rootHash = [BitConverter]::ToString($shaRoot.ComputeHash($rootBytes)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $shaRoot.Dispose()
+    }
+    $createdMutex = $false
+    $script:instanceMutexName = "Local\AI_docker_Instance_$rootHash"
+    $updateMutex = New-Object System.Threading.Mutex($true, "Local\AI_docker_Update_$rootHash", [ref]$createdMutex)
+    if (-not $createdMutex) {
+        $updateMutex.Dispose()
+        $updateMutex = $null
+        $shouldRestoreOnFail = $false
+        throw "已有其他 AI docker 更新进程正在运行，请稍后重试。"
+    }
+    $hasUpdateMutex = $true
+
+    # 1. Wait for exiting AI docker instance (or gracefully close running instance)
     if ($WaitPid -gt 0) {
         $shouldRestoreOnFail = (-not $NoLaunch)
         Write-Info "Waiting for AI docker (PID $WaitPid) to exit..."
@@ -210,7 +310,7 @@ try {
 
     $dirtyRes = Invoke-Git @("status", "--porcelain", "--untracked-files=no")
     if ($dirtyRes.Code -ne 0) {
-        throw "无法检查 Git 工作区状态：`n$($dirtyRes.Output)"
+        throw "无法检查 Git 工作区状态：`n$($dirtyRes.Combined)"
     }
     if ($dirtyRes.Output) {
         throw "检测到本地有未提交的代码改动，为避免覆盖你的修改已取消自动更新。请先提交或 git stash 后再更新。"
@@ -241,7 +341,7 @@ try {
     $targetRef = "refs/ai-docker/update-$([Guid]::NewGuid().ToString('N'))"
     $fetchRes = Invoke-Git @("fetch", "--no-tags", "--no-write-fetch-head", $remoteName, "${remoteBranch}:$targetRef")
     if ($fetchRes.Code -ne 0) {
-        throw "git fetch 失败：`n$($fetchRes.Output)"
+        throw "git fetch 失败：`n$($fetchRes.Combined)"
     }
     $targetRes = Invoke-Git @("rev-parse", "--verify", "${targetRef}^{commit}")
     if ($targetRes.Code -ne 0 -or -not $beforeSha) {
@@ -267,7 +367,7 @@ try {
 
     $diffRes = Invoke-Git @("diff", "--name-only", $beforeSha, $targetSha)
     if ($diffRes.Code -ne 0) {
-        throw "无法检查目标版本变更：`n$($diffRes.Output)"
+        throw "无法检查目标版本变更：`n$($diffRes.Combined)"
     }
     $changedFiles = @($diffRes.Output -split "`r?`n" | Where-Object { $_ })
     $depsChanged = $changedFiles | Where-Object { $_ -in @("pyproject.toml", "uv.lock") }
@@ -276,9 +376,7 @@ try {
         throw "该版本需要同步 Python 依赖，请安装 uv 后重新运行更新。"
     }
 
-    if ($WaitPid -le 0 -and -not $NoLaunch) {
-        Stop-RunningAiDockerGracefully
-    }
+    Stop-RunningAiDockerGracefully
     $currentHead = (Invoke-Git @("rev-parse", "HEAD")).Output
     $currentBranch = (Invoke-Git @("rev-parse", "--abbrev-ref", "HEAD")).Output
     if ($currentHead -ne $beforeSha -or $currentBranch -ne $branch) {
@@ -298,7 +396,7 @@ try {
                 Remove-Item -LiteralPath $pendingSyncPath
                 $runtimeReady = $true
             }
-            throw "git merge --ff-only 失败：`n$($mergeRes.Output)"
+            throw "git merge --ff-only 失败：`n$($mergeRes.Combined)"
         }
         Write-Info $mergeRes.Output
     }
@@ -308,7 +406,7 @@ try {
         Write-Info "Dependencies changed; running uv sync..."
         $uvRes = Invoke-Native -FilePath "uv" -Arguments @("sync", "--locked")
         if ($uvRes.Code -ne 0) {
-            throw "uv sync 执行失败。请在问题解决后重新运行 update.ps1 继续更新：`n$($uvRes.Output)"
+            throw "uv sync 执行失败。请在问题解决后重新运行 update.ps1 继续更新：`n$($uvRes.Combined)"
         }
         Remove-Item -LiteralPath $pendingSyncPath
         $runtimeReady = $true
@@ -324,24 +422,31 @@ try {
         Write-Info "Rebuilding AI docker.exe launcher..."
         try {
             & $buildScript
+            if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
+                throw "build_launcher.ps1 exited with code $LASTEXITCODE"
+            }
         } catch {
+            $launcherBuildFailed = $true
             Write-Info "Warning: build_launcher.ps1 failed ($($_.Exception.Message)); falling back to pythonw."
         }
     }
 
-    Write-Info "Update complete ($beforeSha -> $targetSha)."
-
-    # 6. Relaunch AI docker
+    # 6. Release update mutex and relaunch AI docker before declaring success
     if (-not $NoLaunch) {
-        Start-AiDocker
+        Release-UpdateMutex
+        Start-AiDocker -PreferPythonFallback:$launcherBuildFailed
     }
+
+    Write-Info "Update complete ($beforeSha -> $targetSha)."
 } catch {
+    Release-UpdateMutex
     if ($runtimeReady -and $shouldRestoreOnFail) {
-        try { Start-AiDocker } catch { }
+        try { Start-AiDocker -PreferPythonFallback:$launcherBuildFailed } catch { }
     }
     Show-UpdateError $_.Exception.Message
     exit 1
 } finally {
+    Release-UpdateMutex
     if ($targetRef) {
         [void](Invoke-Git @("update-ref", "-d", $targetRef))
     }

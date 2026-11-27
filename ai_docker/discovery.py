@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import re
+import shlex
 import shutil
+import sys
 import winreg
+from ctypes import wintypes
 from pathlib import Path
 from typing import Any
 
@@ -147,8 +151,35 @@ def _is_skipped_exe(name: str) -> bool:
     return any(tok in low for tok in SKIP_EXE_NAMES)
 
 
-def _resolve_lnk(lnk_path: Path, shell: Any = None) -> tuple[str, str]:
-    """Return (target_exe_path, display_name) for a .lnk shortcut."""
+def _split_windows_args(raw: str) -> list[str]:
+    text = (raw or "").strip()
+    if not text:
+        return []
+    if sys.platform == "win32":
+        try:
+            shell32 = ctypes.windll.shell32
+            kernel32 = ctypes.windll.kernel32
+            shell32.CommandLineToArgvW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+            shell32.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
+            kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+            kernel32.LocalFree.restype = wintypes.HLOCAL
+            argc = ctypes.c_int(0)
+            argv = shell32.CommandLineToArgvW(f"ai_docker_arg0 {text}", ctypes.byref(argc))
+            if argv:
+                try:
+                    return [argv[i] for i in range(1, argc.value)]
+                finally:
+                    kernel32.LocalFree(argv)
+        except Exception:
+            pass
+    try:
+        return shlex.split(text, posix=False)
+    except ValueError:
+        return [text]
+
+
+def _resolve_lnk_details(lnk_path: Path, shell: Any = None) -> tuple[str, str, list[str], str]:
+    """Return (target_exe_path, display_name, args, working_dir) for a .lnk shortcut."""
     try:
         if shell is None:
             import win32com.client
@@ -156,9 +187,17 @@ def _resolve_lnk(lnk_path: Path, shell: Any = None) -> tuple[str, str]:
             shell = win32com.client.Dispatch("WScript.Shell")
         sc = shell.CreateShortcut(str(lnk_path))
         target = (sc.Targetpath or "").strip()
-        return target, lnk_path.stem
+        args = _split_windows_args(sc.Arguments or "")
+        work_dir = (sc.WorkingDirectory or "").strip()
+        return target, lnk_path.stem, args, work_dir
     except Exception:
-        return "", lnk_path.stem
+        return "", lnk_path.stem, [], ""
+
+
+def _resolve_lnk(lnk_path: Path, shell: Any = None) -> tuple[str, str]:
+    """Return (target_exe_path, display_name) for a .lnk shortcut."""
+    target, stem, _, _ = _resolve_lnk_details(lnk_path, shell=shell)
+    return target, stem
 
 
 def build_agent_from_file(
@@ -166,15 +205,17 @@ def build_agent_from_file(
 ) -> dict[str, Any] | None:
     """Build a valid Agent config dict from a dropped or selected .exe / .lnk file."""
     p = Path(file_path)
-    if not p.exists():
+    if not p.is_file():
         return None
 
     display_name = p.stem
     target_exe = str(p)
+    args: list[str] = []
+    work_dir = ""
 
     if p.suffix.lower() == ".lnk":
-        resolved, stem = _resolve_lnk(p)
-        if not resolved or not Path(resolved).exists():
+        resolved, stem, args, work_dir = _resolve_lnk_details(p)
+        if not resolved:
             return None
         target_exe = resolved
         display_name = stem
@@ -182,8 +223,10 @@ def build_agent_from_file(
         return None
 
     exe_path = Path(target_exe)
+    if not exe_path.is_file() or exe_path.suffix.lower() != ".exe":
+        return None
     existing_ids = {a.get("id", "") for a in existing_agents}
-    return {
+    entry: dict[str, Any] = {
         "id": slugify_id(display_name, existing_ids),
         "name": display_name,
         "type": "exe",
@@ -191,9 +234,14 @@ def build_agent_from_file(
         "match_process": exe_path.name,
         "enabled": True,
     }
+    if args:
+        entry["args"] = args
+    if work_dir and Path(work_dir).is_dir():
+        entry["cwd"] = work_dir
+    return entry
 
 
-def _scan_shortcuts() -> list[tuple[str, str]]:
+def _scan_shortcuts() -> list[tuple[str, str, list[str], str]]:
     """Scan Desktop & Start Menu shortcuts (fast, small directories) for AI agents."""
     userprofile = Path(os.environ.get("USERPROFILE", ""))
     appdata = Path(os.environ.get("APPDATA", ""))
@@ -205,7 +253,7 @@ def _scan_shortcuts() -> list[tuple[str, str]]:
         appdata / "Microsoft/Windows/Start Menu/Programs",
         programdata / "Microsoft/Windows/Start Menu/Programs",
     ]
-    results: list[tuple[str, str]] = []
+    results: list[tuple[str, str, list[str], str]] = []
     shell: Any = None
     try:
         import win32com.client
@@ -224,10 +272,10 @@ def _scan_shortcuts() -> list[tuple[str, str]]:
                     continue
                 if _is_skipped_exe(low):
                     continue
-                target, disp = _resolve_lnk(item, shell=shell)
-                if target and target.lower().endswith(".exe") and Path(target).exists():
+                target, disp, args, work_dir = _resolve_lnk_details(item, shell=shell)
+                if target and target.lower().endswith(".exe") and Path(target).is_file():
                     if not _is_skipped_exe(Path(target).name):
-                        results.append((target, disp))
+                        results.append((target, disp, args, work_dir))
         except Exception:
             continue
     return results
@@ -307,23 +355,32 @@ def discover_new_agents(existing_agents: list[dict[str, Any]]) -> list[dict[str,
     candidates: list[dict[str, Any]] = []
 
     # 1. Desktop Win32 apps (shortcuts + shallow program dirs)
-    for exe_path, disp_name in _scan_shortcuts() + _scan_program_dirs():
+    desktop_hits: list[tuple[str, str, list[str], str]] = []
+    for item in [*_scan_shortcuts(), *_scan_program_dirs()]:
+        if len(item) == 4:
+            desktop_hits.append(item)
+        else:
+            desktop_hits.append((item[0], item[1], [], ""))
+    for exe_path, disp_name, args, work_dir in desktop_hits:
         norm = _norm_path(exe_path)
         if not norm or norm in seen_paths:
             continue
         seen_paths.add(norm)
         aid = slugify_id(disp_name, used_ids)
         used_ids.add(aid)
-        candidates.append(
-            {
-                "id": aid,
-                "name": disp_name,
-                "type": "exe",
-                "path": exe_path,
-                "match_process": os.path.basename(exe_path),
-                "enabled": True,
-            }
-        )
+        entry: dict[str, Any] = {
+            "id": aid,
+            "name": disp_name,
+            "type": "exe",
+            "path": exe_path,
+            "match_process": os.path.basename(exe_path),
+            "enabled": True,
+        }
+        if args:
+            entry["args"] = list(args)
+        if work_dir and Path(work_dir).is_dir():
+            entry["cwd"] = work_dir
+        candidates.append(entry)
 
     # 2. MSIX / Store apps
     for item in _scan_msix_packages():

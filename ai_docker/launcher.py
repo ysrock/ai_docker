@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import ctypes
 import os
 import re
@@ -19,6 +20,7 @@ import win32gui
 import win32process
 
 from .config import PROJECT_ROOT
+from .web_utils import normalize_web_url
 
 kernel32 = ctypes.windll.kernel32
 user32 = ctypes.windll.user32
@@ -39,6 +41,21 @@ kernel32.QueryFullProcessImageNameW.argtypes = [
     ctypes.POINTER(wintypes.DWORD),
 ]
 kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+kernel32.GetCurrentThreadId.argtypes = []
+kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+user32.AttachThreadInput.restype = wintypes.BOOL
+user32.ShowWindowAsync.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.ShowWindowAsync.restype = wintypes.BOOL
+user32.IsHungAppWindow.argtypes = [wintypes.HWND]
+user32.IsHungAppWindow.restype = wintypes.BOOL
+dwmapi.DwmGetWindowAttribute.argtypes = [
+    wintypes.HWND,
+    wintypes.DWORD,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+]
+dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
 
 
 def _get_process_path(pid: int) -> str:
@@ -378,13 +395,17 @@ def get_running_agent_ids(agents: list[dict[str, Any]]) -> set[str]:
 def focus_hwnd(hwnd: int) -> bool:
     if not win32gui.IsWindow(hwnd):
         return False
+    hwnd_w = wintypes.HWND(hwnd)
     try:
+        if user32.IsHungAppWindow(hwnd_w):
+            return False
         if win32gui.IsIconic(hwnd):
-            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            user32.ShowWindowAsync(hwnd_w, win32con.SW_RESTORE)
         else:
-            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+            user32.ShowWindowAsync(hwnd_w, win32con.SW_SHOW)
 
         fg_hwnd = win32gui.GetForegroundWindow()
+        fg_hung = bool(fg_hwnd and user32.IsHungAppWindow(wintypes.HWND(fg_hwnd)))
         fg_tid = win32process.GetWindowThreadProcessId(fg_hwnd)[0] if fg_hwnd else 0
         target_tid = win32process.GetWindowThreadProcessId(hwnd)[0]
         cur_tid = kernel32.GetCurrentThreadId()
@@ -392,7 +413,7 @@ def focus_hwnd(hwnd: int) -> bool:
         attached_fg = False
         attached_target = False
         try:
-            if fg_tid and fg_tid != cur_tid:
+            if fg_tid and fg_tid != cur_tid and not fg_hung:
                 attached_fg = bool(user32.AttachThreadInput(cur_tid, fg_tid, True))
             if target_tid and target_tid != cur_tid:
                 attached_target = bool(user32.AttachThreadInput(cur_tid, target_tid, True))
@@ -401,20 +422,21 @@ def focus_hwnd(hwnd: int) -> bool:
             win32gui.SetForegroundWindow(hwnd)
             return True
         except Exception:
-            # Windows foreground lock fallback: pulse TOPMOST -> NOTOPMOST to raise window
+            # Windows foreground lock fallback: pulse TOPMOST -> NOTOPMOST asynchronously
             flags = (
                 win32con.SWP_NOMOVE
                 | win32con.SWP_NOSIZE
                 | win32con.SWP_SHOWWINDOW
+                | win32con.SWP_ASYNCWINDOWPOS
             )
             win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0, flags)
             win32gui.SetWindowPos(hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0, flags)
             win32gui.BringWindowToTop(hwnd)
             try:
                 win32gui.SetForegroundWindow(hwnd)
+                return True
             except Exception:
-                pass
-            return True
+                return int(win32gui.GetForegroundWindow() or 0) == int(hwnd)
         finally:
             if attached_target:
                 user32.AttachThreadInput(cur_tid, target_tid, False)
@@ -499,6 +521,8 @@ def launch_agent(
             if focus_hwnd(target_hwnd):
                 _last_focused_by_agent[aid] = target_hwnd
                 return True, f"focused:{agent.get('name', '')}"
+            if win32gui.IsWindow(target_hwnd):
+                return True, f"focus_deferred:{agent.get('name', '')}"
 
     force_new = not focus_existing
     atype = agent.get("type", "exe")
@@ -532,21 +556,27 @@ def launch_agent(
             wt = shutil.which("wt")
             pwsh = shutil.which("pwsh") or shutil.which("powershell") or "powershell.exe"
             if wt:
+                safe_title = (
+                    re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", str(title)).strip().replace(";", r"\;")
+                    or "Agent CLI"
+                )
+                wt_cwd = str(cwd).replace(";", r"\;")
+                encoded_cmd = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
                 cmd_list = [
                     wt,
                     "-w",
                     "new",
                     "new-tab",
                     "--title",
-                    title,
+                    safe_title,
                     "--suppressApplicationTitle",
                     "-d",
-                    cwd,
+                    wt_cwd,
                     pwsh,
                     "-NoLogo",
                     "-NoExit",
-                    "-Command",
-                    command,
+                    "-EncodedCommand",
+                    encoded_cmd,
                 ]
                 subprocess.Popen(cmd_list, cwd=cwd)
             else:
@@ -558,16 +588,18 @@ def launch_agent(
             return True, f"launched_cli:{command}"
 
         if atype == "web":
-            url = agent.get("url", "")
+            raw_url = agent.get("url", "")
+            url = normalize_web_url(raw_url)
             if not url:
-                return False, "缺少网页 URL"
+                return False, f"无效的网页 URL: {raw_url}"
             if agent.get("app_mode", True):
                 browser = _find_browser(agent.get("browser"))
                 if browser:
                     web_cmd = [browser, "--new-window", f"--app={url}"] if force_new else [browser, f"--app={url}"]
                     subprocess.Popen(web_cmd, creationflags=creationflags)
                     return True, f"launched_web_app:{url}"
-            webbrowser.open(url)
+            if not webbrowser.open(url):
+                return False, f"无法在默认浏览器中打开网页: {url}"
             return True, f"launched_web:{url}"
     except OSError as exc:
         return False, f"进程启动失败: {exc}"

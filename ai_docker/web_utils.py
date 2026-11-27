@@ -4,8 +4,6 @@ import configparser
 from pathlib import Path
 from urllib.parse import urlparse
 
-from .launcher import _find_browser
-
 _GENERIC_SUBDOMAINS = frozenset(
     {"www", "chat", "app", "ai", "web", "console", "portal", "m", "beta", "my"}
 )
@@ -14,7 +12,7 @@ _GENERIC_SUBDOMAINS = frozenset(
 def normalize_web_url(raw_url: str) -> str | None:
     """Validate and normalize an http(s) URL while preserving full path and query parameters."""
     text = (raw_url or "").strip()
-    if not text or any(ch.isspace() for ch in text):
+    if not text or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in text):
         return None
     if "://" not in text:
         text = "https://" + text
@@ -24,6 +22,8 @@ def normalize_web_url(raw_url: str) -> str | None:
     except ValueError:
         return None
     if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        return None
+    if "\\" in parsed.netloc or "@" in parsed.netloc or "%" in parsed.hostname:
         return None
     return text
 
@@ -62,6 +62,8 @@ def read_internet_shortcut_url(file_path: str) -> str | None:
 
 def detect_web_browser_matching(preferred_browser: str | None = None) -> tuple[str, list[str]]:
     """Infer match_process and notification_handlers from the active Chromium browser."""
+    from .launcher import _find_browser
+
     browser = preferred_browser or _find_browser()
     if browser and Path(browser).name.lower() == "msedge.exe":
         return "msedge.exe", ["MSEdge"]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,27 +36,59 @@ class UpdateCheckResult:
         return (not self.has_local_changes) and self.ahead_count == 0
 
 
-def _run_git(repo_root: Path, *args: str, timeout: float = GIT_TIMEOUT_SEC) -> tuple[int, str, str]:
+def _run_git(
+    repo_root: Path,
+    *args: str,
+    timeout: float = GIT_TIMEOUT_SEC,
+    cancelled: Event | None = None,
+) -> tuple[int, str, str]:
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    proc: subprocess.Popen[str] | None = None
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             ["git", *args],
             cwd=str(repo_root),
             env=env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=timeout,
             creationflags=CREATE_NO_WINDOW,
         )
-        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+        deadline = time.monotonic() + timeout
+        while True:
+            if cancelled is not None and cancelled.is_set():
+                proc.kill()
+                try:
+                    proc.communicate(timeout=1.0)
+                except Exception:
+                    pass
+                return -1, "", "已取消检查更新。"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                proc.kill()
+                try:
+                    proc.communicate(timeout=1.0)
+                except Exception:
+                    pass
+                return -2, "", "连接远端仓库超时，请检查网络后重试。"
+            try:
+                stdout, stderr = proc.communicate(timeout=min(0.05, remaining))
+                return proc.returncode, stdout.strip(), stderr.strip()
+            except subprocess.TimeoutExpired:
+                continue
     except FileNotFoundError:
         return -1, "", "未检测到 Git，请先安装 Git 或手动下载最新版本。"
-    except subprocess.TimeoutExpired:
-        return -2, "", "连接远端仓库超时，请检查网络后重试。"
     except OSError as exc:
         return -3, "", str(exc)
+    finally:
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait(timeout=1.0)
+            except Exception:
+                pass
 
 
 def check_for_updates(repo_root: Path = PROJECT_ROOT, *, cancelled: Event | None = None) -> UpdateCheckResult:
@@ -63,7 +96,7 @@ def check_for_updates(repo_root: Path = PROJECT_ROOT, *, cancelled: Event | None
     def git(*args: str, timeout: float = GIT_TIMEOUT_SEC) -> tuple[int, str, str]:
         if cancelled is not None and cancelled.is_set():
             return -1, "", "已取消检查更新。"
-        return _run_git(repo_root, *args, timeout=timeout)
+        return _run_git(repo_root, *args, timeout=timeout, cancelled=cancelled)
 
     if not shutil.which("git"):
         return UpdateCheckResult(

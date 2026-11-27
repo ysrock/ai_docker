@@ -4,21 +4,27 @@ import ctypes
 import hashlib
 import io
 import os
+import socket
 import tempfile
 import time
 import urllib.request
 from collections.abc import Callable
 from ctypes import wintypes
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock, Thread, local
 from typing import Any
 from urllib.parse import urlparse
 
 from PIL import Image
-from PySide6.QtCore import QObject, QRect, QRectF, QRunnable, Qt, QThreadPool, Signal, Slot
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtCore import QObject, QRect, QRectF, QRunnable, QSize, Qt, QThreadPool, Signal, Slot
+from PySide6.QtGui import QColor, QFont, QIcon, QImageReader, QPainter, QPainterPath, QPen, QPixmap
 
 from .config import CACHE_DIR
+
+MAX_ICON_DIMENSION = 4096
+MAX_ICON_PIXELS = 4_000_000
+MAX_CACHED_ICON_SIZE = 256
+_RESPONSE_HOOK = local()
 
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
@@ -343,7 +349,111 @@ def find_msix_icon(aumid: str, theme: str = "dark") -> Path | None:
     return None
 
 
-def fetch_web_icon_to_png(url: str, force: bool = False, *, cancelled: Event | None = None) -> Path | None:
+def _ico_has_safe_dimensions(data: bytes) -> bool:
+    """Validate ICO/CUR directory entries and embedded image headers before decoding."""
+    if len(data) < 6:
+        return False
+    reserved = int.from_bytes(data[0:2], "little")
+    ico_type = int.from_bytes(data[2:4], "little")
+    count = int.from_bytes(data[4:6], "little")
+    if reserved != 0 or ico_type not in (1, 2) or count <= 0 or count > 64:
+        return False
+    dir_end = 6 + count * 16
+    if dir_end > len(data):
+        return False
+    for idx in range(count):
+        entry_off = 6 + idx * 16
+        img_off = int.from_bytes(data[entry_off + 12 : entry_off + 16], "little")
+        if img_off < dir_end or img_off + 16 > len(data):
+            return False
+        if data[img_off : img_off + 8] == b"\x89PNG\r\n\x1a\n":
+            if img_off + 24 > len(data) or data[img_off + 12 : img_off + 16] != b"IHDR":
+                return False
+            w = int.from_bytes(data[img_off + 16 : img_off + 20], "big")
+            h = int.from_bytes(data[img_off + 20 : img_off + 24], "big")
+        else:
+            bi_size = int.from_bytes(data[img_off : img_off + 4], "little")
+            if bi_size < 16:
+                return False
+            w = abs(int.from_bytes(data[img_off + 4 : img_off + 8], "little", signed=True))
+            raw_h = abs(int.from_bytes(data[img_off + 8 : img_off + 12], "little", signed=True))
+            h = raw_h // 2 if raw_h > 1 else raw_h
+        if (
+            w <= 0
+            or h <= 0
+            or w > MAX_ICON_DIMENSION
+            or h > MAX_ICON_DIMENSION
+            or (w * h) > MAX_ICON_PIXELS
+        ):
+            return False
+    return True
+
+
+def _load_bounded_pixmap(file_path: str | Path) -> QPixmap | None:
+    """Decode a local or cached icon image safely within pixel and size bounds."""
+    p = Path(file_path)
+    try:
+        if not p.is_file() or p.stat().st_size > 4 * 1024 * 1024:
+            return None
+        if p.suffix.lower() in (".ico", ".cur") and not _ico_has_safe_dimensions(p.read_bytes()):
+            return None
+        reader = QImageReader(str(p))
+        reader.setAutoTransform(True)
+        sz = reader.size()
+        if sz.isValid():
+            w, h = sz.width(), sz.height()
+            if (
+                w <= 0
+                or h <= 0
+                or w > MAX_ICON_DIMENSION
+                or h > MAX_ICON_DIMENSION
+                or (w * h) > MAX_ICON_PIXELS
+            ):
+                return None
+            if w > MAX_CACHED_ICON_SIZE or h > MAX_CACHED_ICON_SIZE:
+                scaled = sz.scaled(
+                    MAX_CACHED_ICON_SIZE,
+                    MAX_CACHED_ICON_SIZE,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                )
+                reader.setScaledSize(QSize(max(1, scaled.width()), max(1, scaled.height())))
+        img = reader.read()
+        if img.isNull():
+            return None
+        pm = QPixmap.fromImage(img)
+        return None if pm.isNull() else pm
+    except Exception:
+        return None
+
+
+def _abort_response_nonblocking(resp: Any) -> None:
+    """Shutdown and close an active HTTP response on a detached daemon thread."""
+    if resp is None:
+        return
+
+    def _close_worker() -> None:
+        try:
+            fp = getattr(resp, "fp", None)
+            raw = getattr(fp, "raw", None)
+            sock = getattr(raw, "_sock", None) or getattr(fp, "_sock", None)
+            if sock is not None and hasattr(sock, "shutdown"):
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            resp.close()
+        except Exception:
+            pass
+
+    Thread(target=_close_worker, daemon=True).start()
+
+
+def fetch_web_icon_to_png(
+    url: str,
+    force: bool = False,
+    *,
+    cancelled: Event | None = None,
+) -> Path | None:
     try:
         parsed = urlparse(url)
         if not parsed.scheme:
@@ -377,27 +487,76 @@ def fetch_web_icon_to_png(url: str, force: bool = False, *, cancelled: Event | N
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
         )
     }
+    total_deadline = time.monotonic() + 2.5
+    reg_cb = getattr(_RESPONSE_HOOK, "register", None)
+    unreg_cb = getattr(_RESPONSE_HOOK, "unregister", None)
     for cand in candidates:
         if cancelled is not None and cancelled.is_set():
             return None
-        try:
-            req = urllib.request.Request(cand, headers=headers)
-            deadline = time.monotonic() + 2.0
-            with urllib.request.urlopen(req, timeout=2.0) as resp:
-                data = bytearray()
-                while chunk := resp.read1(65536):
-                    if cancelled is not None and cancelled.is_set():
-                        return None
-                    data.extend(chunk)
-                    if len(data) > 2 * 1024 * 1024 or time.monotonic() >= deadline:
-                        raise ValueError("Icon download exceeded its limit")
-            if not data or (cancelled is not None and cancelled.is_set()):
+        remaining = total_deadline - time.monotonic()
+        if remaining <= 0.05:
+            break
+
+        done = Event()
+        state: dict[str, Any] = {"resp": None, "data": None, "error": None}
+
+        def _download_worker(candidate: str = cand, timeout_val: float = min(1.5, remaining)) -> None:
+            try:
+                req = urllib.request.Request(candidate, headers=headers)
+                with urllib.request.urlopen(req, timeout=timeout_val) as resp:
+                    state["resp"] = resp
+                    if reg_cb is not None:
+                        reg_cb(resp)
+                    try:
+                        buf = bytearray()
+                        while chunk := resp.read1(65536):
+                            if (cancelled is not None and cancelled.is_set()) or time.monotonic() >= total_deadline:
+                                return
+                            buf.extend(chunk)
+                            if len(buf) > 2 * 1024 * 1024 or time.monotonic() >= total_deadline:
+                                raise ValueError("Icon download exceeded its limit")
+                        state["data"] = buf
+                    finally:
+                        if unreg_cb is not None:
+                            unreg_cb(resp)
+            except Exception as exc:
+                state["error"] = exc
+            finally:
+                state["resp"] = None
+                done.set()
+
+        Thread(target=_download_worker, daemon=True).start()
+        while not done.wait(0.05):
+            if (cancelled is not None and cancelled.is_set()) or time.monotonic() >= total_deadline:
+                _abort_response_nonblocking(state.get("resp"))
+                return None
+
+        if cancelled is not None and cancelled.is_set():
+            return None
+        data = state.get("data")
+        if not data:
+            continue
+        raw_bytes = bytes(data)
+        if len(raw_bytes) >= 4 and raw_bytes[:4] in (b"\x00\x00\x01\x00", b"\x00\x00\x02\x00"):
+            if not _ico_has_safe_dimensions(raw_bytes):
                 continue
-            with Image.open(io.BytesIO(data)) as img:
+        try:
+            with Image.open(io.BytesIO(raw_bytes)) as img:
+                w, h = img.size
+                if (
+                    w <= 0
+                    or h <= 0
+                    or w > MAX_ICON_DIMENSION
+                    or h > MAX_ICON_DIMENSION
+                    or (w * h) > MAX_ICON_PIXELS
+                ):
+                    continue
                 rgba = img.convert("RGBA")
                 # Skip tiny 16x16 blank placeholders if larger source exists
                 if rgba.width < 24 and cand != candidates[-1]:
                     continue
+                if rgba.width > MAX_CACHED_ICON_SIZE or rgba.height > MAX_CACHED_ICON_SIZE:
+                    rgba.thumbnail((MAX_CACHED_ICON_SIZE, MAX_CACHED_ICON_SIZE), Image.Resampling.LANCZOS)
                 # Other workers may read the same cache entry while it is being refreshed.
                 with tempfile.NamedTemporaryFile(dir=cache_file.parent, delete=False) as temporary:
                     temporary_path = Path(temporary.name)
@@ -414,7 +573,14 @@ def fetch_web_icon_to_png(url: str, force: bool = False, *, cancelled: Event | N
 
 class _WebIconRequest(QRunnable):
     def __init__(
-        self, url: str, force: bool, generation: int, cancelled: Event, complete: Callable[..., None]
+        self,
+        url: str,
+        force: bool,
+        generation: int,
+        cancelled: Event,
+        complete: Callable[..., None],
+        register_response: Callable[[Any], None] | None = None,
+        unregister_response: Callable[[Any], None] | None = None,
     ) -> None:
         super().__init__()
         self.url = url
@@ -422,14 +588,21 @@ class _WebIconRequest(QRunnable):
         self.generation = generation
         self.cancelled = cancelled
         self.complete = complete
+        self._register_response = register_response
+        self._unregister_response = unregister_response
 
     def run(self) -> None:
         path = None
+        _RESPONSE_HOOK.register = self._register_response
+        _RESPONSE_HOOK.unregister = self._unregister_response
         try:
             if not self.cancelled.is_set():
                 path = fetch_web_icon_to_png(self.url, self.force, cancelled=self.cancelled)
         except Exception:
             pass
+        finally:
+            _RESPONSE_HOOK.register = None
+            _RESPONSE_HOOK.unregister = None
         try:
             self.complete(self.generation, self.url, path)
         except RuntimeError:
@@ -447,14 +620,32 @@ class WebIconLoader(QObject):
         super().__init__(parent)
         self._generation = 0
         self._cancelled = Event()
+        self._lock = Lock()
+        self._active_responses: set[Any] = set()
         self._paths: dict[str, Path | None] = {}
         self._in_flight: set[str] = set()
         self._deferred: dict[str, bool] = {}
         self._downloaded.connect(self._store_path, Qt.ConnectionType.QueuedConnection)
 
+    def _register_response(self, resp: Any) -> None:
+        with self._lock:
+            if self._cancelled.is_set():
+                _abort_response_nonblocking(resp)
+                return
+            self._active_responses.add(resp)
+
+    def _unregister_response(self, resp: Any) -> None:
+        with self._lock:
+            self._active_responses.discard(resp)
+
     def invalidate(self) -> None:
-        self._cancelled.set()
-        self._cancelled = Event()
+        with self._lock:
+            self._cancelled.set()
+            active = list(self._active_responses)
+            self._active_responses.clear()
+            self._cancelled = Event()
+        for resp in active:
+            _abort_response_nonblocking(resp)
         self._generation += 1
         self._paths.clear()
         self._deferred.clear()
@@ -470,7 +661,15 @@ class WebIconLoader(QObject):
 
     def _start(self, url: str, force: bool) -> None:
         self._in_flight.add(url)
-        request = _WebIconRequest(url, force, self._generation, self._cancelled, self._downloaded.emit)
+        request = _WebIconRequest(
+            url,
+            force,
+            self._generation,
+            self._cancelled,
+            self._downloaded.emit,
+            register_response=self._register_response,
+            unregister_response=self._unregister_response,
+        )
         QThreadPool.globalInstance().start(request)
 
     @Slot(int, str, object)
@@ -521,7 +720,7 @@ def _make_monogram_pixmap(name: str, size: int = 64, accent: str | None = None) 
 
 
 def _round_pixmap(pm: QPixmap, radius_ratio: float = 0.22) -> QPixmap:
-    size = max(pm.width(), pm.height(), 64)
+    size = min(max(pm.width(), pm.height(), 64), MAX_CACHED_ICON_SIZE)
     canvas = QPixmap(size, size)
     canvas.fill(Qt.transparent)
 
@@ -543,7 +742,7 @@ def _round_pixmap(pm: QPixmap, radius_ratio: float = 0.22) -> QPixmap:
 
 
 def _apply_cli_badge(pm: QPixmap) -> QPixmap:
-    size = max(pm.width(), pm.height(), 64)
+    size = min(max(pm.width(), pm.height(), 64), MAX_CACHED_ICON_SIZE)
     canvas = QPixmap(size, size)
     canvas.fill(Qt.transparent)
 
@@ -590,9 +789,7 @@ def load_agent_icon(
     # 1. Explicit icon file path
     icon_file = agent.get("icon")
     if icon_file and Path(icon_file).exists():
-        candidate = QPixmap(icon_file)
-        if not candidate.isNull():
-            pm = candidate
+        pm = _load_bounded_pixmap(icon_file)
 
     # 2. Explicit icon_source (can be exe, aumid, or url)
     icon_src = agent.get("icon_source")
@@ -600,18 +797,18 @@ def load_agent_icon(
         if icon_src.lower().startswith(("http://", "https://")):
             web_png = resolve_web_icon(icon_src, force_refresh) if resolve_web_icon else None
             if web_png:
-                pm = QPixmap(str(web_png))
+                pm = _load_bounded_pixmap(web_png)
         elif "!" in icon_src and not Path(icon_src).exists():
             msix_png = find_msix_icon(icon_src, theme=theme)
             if msix_png:
-                pm = QPixmap(str(msix_png))
+                pm = _load_bounded_pixmap(msix_png)
         elif Path(icon_src).exists():
             if Path(icon_src).suffix.lower() in (".png", ".ico", ".svg", ".jpg", ".webp"):
-                pm = QPixmap(icon_src)
+                pm = _load_bounded_pixmap(icon_src)
             else:
                 exe_png = extract_exe_icon_to_png(icon_src, force=force_refresh)
                 if exe_png:
-                    pm = QPixmap(str(exe_png))
+                    pm = _load_bounded_pixmap(exe_png)
 
     # 3. Auto-extract by agent type
     atype = agent.get("type", "exe")
@@ -619,20 +816,20 @@ def load_agent_icon(
         if atype == "exe" and agent.get("path"):
             exe_png = extract_exe_icon_to_png(agent["path"], force=force_refresh)
             if exe_png:
-                pm = QPixmap(str(exe_png))
+                pm = _load_bounded_pixmap(exe_png)
         elif atype == "msix" and agent.get("aumid"):
             msix_png = find_msix_icon(agent["aumid"], theme=theme)
             if msix_png:
-                pm = QPixmap(str(msix_png))
+                pm = _load_bounded_pixmap(msix_png)
         elif atype == "web" and agent.get("url") and resolve_web_icon:
             web_png = resolve_web_icon(agent["url"], force_refresh)
             if web_png:
-                pm = QPixmap(str(web_png))
+                pm = _load_bounded_pixmap(web_png)
         elif atype == "cli":
             # Fallback to Windows Terminal real icon if no specific brand icon_source
             wt_png = find_msix_icon("Microsoft.WindowsTerminal_8wekyb3d8bbwe!App", theme=theme)
             if wt_png:
-                pm = QPixmap(str(wt_png))
+                pm = _load_bounded_pixmap(wt_png)
 
     if pm is None or pm.isNull():
         pm = _make_monogram_pixmap(agent.get("name", "?"), 64, agent.get("accent"))

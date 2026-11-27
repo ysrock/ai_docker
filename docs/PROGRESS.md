@@ -107,6 +107,16 @@
 - **拖拽手柄双击一键收缩为悬浮图标**：
   - `ai_docker/dock_window.py`：`DragGrip` 新增 `double_clicked` 信号及 `mouseDoubleClickEvent()` 响应，双击左侧/顶部拖拽点阵区立即调用 `_collapse_dock(force=True)` 收缩为单个悬浮图标（含 450ms 防弹回冷却并保持纵向靠右镜像锚点不偏移）；同时在 `mouseReleaseEvent()` 增加原地未移动判定跳过冗余配置写盘。
   - 在 `tests/test_regressions.py` 新增 `test_drag_grip_double_click_collapses_to_orb_without_saving_config`（累计 25 项回归测试）。
+- **Codex (`gpt-6.2-sol` / `high`) 第 1、2 轮全项目审查与闭环修复**：
+  - **配置与并发锁**：`ai_docker/config.py` 新增跨进程可重入文件锁 `update_config()`、首次缺失配置建档加锁与重复 ID 校验，`dock_window.py`（添加/发现/拖放）与 `cli.py` 全部在锁内去重；`main.py` 与 `update.ps1` 引入安装级实例锁 `Local\AI_docker_Instance_<hash>` + 更新互斥锁 `Local\AI_docker_Update_<hash>`（只读 `OpenMutexW` 探测），消除启动与更新并发竞态。
+  - **启动器与更新器**：`update.ps1` 增加实例互斥锁轮询等待并校验 `Start-AiDocker` 入口与退出码，缺失入口或重启失败时明确报错；`ai_docker/launcher.py` 改用 ctypes `user32.ShowWindowAsync`（修复 `pywin32` 无 `ShowWindowAsync` 属性报错）与 `IsHungAppWindow` 防无响应卡死、`SWP_ASYNCWINDOWPOS`，并同时为 `wt.exe` 命令正文（`-EncodedCommand`）与 `-d` 工作目录分号转义。
+  - **包装器与扫描发现**：新增无损 JSON 传参机制的 `ai-docker.ps1` 与 `DisableDelayedExpansion` 优化的 `ai-docker.cmd`，`cli.py` 限制仅扫描 `--` 之前的 `--json`；`ai_docker/discovery.py` 为 `CommandLineToArgvW` 补齐虚拟 `arg0` 避开程序名规则特例，并在自动扫描快捷方式时完整保留 `args` 与 `cwd`。
+  - **图标、通知与交互布局**：`ai_docker/icons.py` 通过后台阻塞隔离与异步 socket shutdown 实现 `< 50ms` 取消退出与零主线程阻塞并拦截超大像素图；`ai_docker/notifications.py` 在 SQLite 事务快照内原子推进水位线，`dock_window.py` 在清除全部前刷新最新窗口标题；`dock_window.py` 修复 `PreciseTimer` 双击仲裁并补全窄横向/矮纵向（20 Agent 溢出 `+N` 菜单与任务栏排除）约束，全部 29 项回归测试在真实 Windows 环境验证通过。
+  - **其余 5 项低优先级建议项（ADVISORY）清理与收口**：`ai_docker/web_utils.py` 拦截含 `\`、`@` 及主机 `%` 编码的畸形 URL；`ai_docker/icons.py` 新增 `_ico_has_safe_dimensions()` 与 `QImageReader` 受限解码（`<= 256px` / `<= 400万像素`）；`ai_docker/dock_window.py` 对齐共享窗口释放后的任务栏图标展示；`ai_docker/ipc.py` 与 `ai_docker/cli.py` 区分 UIPI 权限拦截（`permission_denied`）与实例未运行；`update.ps1` 分离 `Invoke-Native` 的 `stdout` 与 `stderr` 避免 `GIT_TRACE` 调试输出污染分支/路径判定；`.gitignore` 新增 `.agents.json.lock`。
+- **Chrome 任务栏图标强制保留（2026-11-27）**：
+  - `ai_docker/config.py` 与 `ai_docker/taskbar.py` 新增 `TASKBAR_HIDE_EXCLUDED_PROCESSES`（包含 `chrome.exe`）及 `is_taskbar_hide_excluded_process()` / `is_taskbar_hide_excluded_agent()` 判定。
+  - `ai_docker/dock_window.py` 在 `_refresh_state()` 中强制将 Chrome（`chrome.exe`）相关窗口排除出任务栏隐藏集合（保留悬浮窗的窗口识别、点击切换与通知提醒），并在单 Agent 菜单、全局释放菜单与图标状态点上同步提示“Chrome 保留在任务栏”；`ai_docker/cli.py` 同步 `released_to_taskbar` 状态输出。
+  - `tests/test_regressions.py` 新增 `test_chrome_windows_are_never_hidden_from_taskbar` 回归验证（累计 30 项回归测试）。
 
 ## 后续规划
 - 支持自定义全局快捷键呼出/切换悬浮窗。

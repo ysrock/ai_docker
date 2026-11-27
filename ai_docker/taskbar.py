@@ -7,6 +7,19 @@ import win32con
 import win32gui
 from win32com.shell import shell
 
+from .config import (
+    TASKBAR_HIDE_EXCLUDED_PROCESSES,
+    is_taskbar_hide_excluded_agent,
+    is_taskbar_hide_excluded_process,
+)
+
+__all__ = [
+    "TASKBAR_HIDE_EXCLUDED_PROCESSES",
+    "TaskbarHider",
+    "is_taskbar_hide_excluded_agent",
+    "is_taskbar_hide_excluded_process",
+]
+
 
 def _has_taskbar_style(hwnd: int) -> bool:
     style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
